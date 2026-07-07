@@ -191,8 +191,13 @@ class LaneDetectionNode(Node):
         )
         self.detection_pub = self.create_publisher(LaneDetection, detection_topic, 10)
         self.debug_pub = None
+        # 회전로 튜닝용: detect_on_yellow 가 실제로 쓰는 '닫힘 적용된 노란 마스크'를
+        # 눈으로 보게 발행(점선이 이어졌는지 확인 → yellow_close_ksize 튜닝).
+        self.yellow_closed_pub = None
         if self.debug_image:
             self.debug_pub = self.create_publisher(CompressedImage, debug_topic, image_qos)
+            self.yellow_closed_pub = self.create_publisher(
+                CompressedImage, '/lane_detection/image/yellow_closed', image_qos)
 
         self.get_logger().info(
             'lane_detection node started (perception only):\n'
@@ -723,6 +728,20 @@ class LaneDetectionNode(Node):
 
         if self.debug_pub is not None:
             self.publish_debug(edge, result, msg)
+
+        # 회전로 튜닝: 닫힘 적용된 노란 마스크를 발행(점선 이어짐 확인용).
+        if (self.yellow_closed_pub is not None and yellow is not None
+                and yellow.shape == edge.shape):
+            yc = self.closed_yellow(yellow)
+            ok, enc = cv2.imencode(
+                '.jpg', yc, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
+            if ok:
+                out = CompressedImage()
+                out.header.stamp = msg.header.stamp
+                out.header.frame_id = 'yellow_closed'
+                out.format = 'jpeg'
+                out.data = enc.tobytes()
+                self.yellow_closed_pub.publish(out)
 
     # ------------------------------------------------------------------- debug
     def publish_debug(self, edge, result, source_msg: CompressedImage):
