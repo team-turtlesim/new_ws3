@@ -155,6 +155,10 @@ class LaneDetectionNode(Node):
         self.junction_active = False     # 지금 junction 위에 있나(중복 카운트 방지 래치)
         self.junction_on = 0             # junction 감지 디바운스(rising)
         self.junction_off = 0            # junction 해제 디바운스(falling)
+        # 디버그 로그용 최신 관측값(회전로 임계값 튜닝에 사용)
+        self.dbg_white = 0
+        self.dbg_yellow = 0
+        self.dbg_jscore = 0.0
 
         image_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -256,10 +260,9 @@ class LaneDetectionNode(Node):
                 rows_seen += 1
                 if len(clusters) >= min_c:
                     rows_hit += 1
-        if rows_seen == 0:
-            return False
-        frac = float(self.get_parameter('junction_rows_frac').value)
-        return (rows_hit / float(rows_seen)) >= frac
+        score = 0.0 if rows_seen == 0 else rows_hit / float(rows_seen)
+        self.dbg_jscore = score  # 디버그: junction 점수(3+클러스터 행 비율)
+        return score >= float(self.get_parameter('junction_rows_frac').value)
 
     def _trans(self, cond):
         """상태전이 조건이 debounce 프레임 연속 참이면 True. 상태당 한 조건만
@@ -335,6 +338,7 @@ class LaneDetectionNode(Node):
         EXIT        : 출구쪽 bias + 노란 램프 추종. 노란색 사라짐 → LANE_FOLLOW.
         detect_lane 을 흰/노란 마스크에 그대로 태워 '두 선 중앙잡기'를 재사용한다."""
         white_n, yellow_n = self.mask_counts(edge, yellow)
+        self.dbg_white, self.dbg_yellow = white_n, yellow_n  # 디버그용 스태시
         enter_p = int(self.get_parameter('yellow_enter_pixels').value)
         white_low = int(self.get_parameter('white_low_pixels').value)
         yellow_gone = int(self.get_parameter('yellow_gone_pixels').value)
@@ -648,6 +652,8 @@ class LaneDetectionNode(Node):
             lc = result['lane_center']
             self.get_logger().info(
                 f"rstate={self.rstate} jcnt={self.junction_count} "
+                f"jactive={int(self.junction_active)} jscore={self.dbg_jscore:.2f} "
+                f"white={self.dbg_white} yellow={self.dbg_yellow} "
                 f"lane_width_px={self.lane_width_px:.0f} "
                 f"L={int(result['left_detected'])} R={int(result['right_detected'])} "
                 f"lane_center={('%.0f' % lc) if lc is not None else 'None'} "
