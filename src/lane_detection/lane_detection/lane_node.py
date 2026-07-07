@@ -96,49 +96,53 @@ class LaneDetectionNode(Node):
         self.declare_parameter('track_tol_px', 40.0)
 
         # =================================================================
-        # 회전 교차로(중앙 노란 링) 주행 FSM
+        # 회전 교차로(중앙 노란 링) 주행 FSM — 상대·기하 기반(sim→실차 이식성)
         # =================================================================
-        # 트랙 흐름: 본선(흰) →진입→ 노란 링 →(출구 스킵 후 다시)→ 탈출→ 본선(빨강쪽)
-        # 원리: 상태(LANE_FOLLOW/ENTER/IN_LOOP/EXIT)로 진입·출구를 구분하고,
-        #   "링 안에서 만난 출구(노란 junction)를 몇 번째로 만났나"로 탈출 시점을 정한다
-        #   (첫 출구는 스킵, exits_to_skip+1 번째에서 탈출 → '1회전 이상' 규정 충족).
-        #   조향은 상태별로 흰/노란 마스크를 detect_lane 에 바꿔 끼워 재사용한다.
-        # odom/IMU 없음 → 카운트가 주 신호, 시간(min/max_loop_sec)은 안전 백스톱.
+        # 트랙 흐름: 본선(흰) →진입→ 노란 링 →(출구 랜드마크 2번째)→ 탈출→ 본선(빨강쪽)
+        # 설계 원칙: 색·해상도에 안 휘둘리게 '절대 픽셀 수' 대신 '비율/개수/시간'을 쓴다.
+        #   - 상태 전환: 흰/노란 '픽셀 비율'(yellow/(yellow+white), 해상도 무관)
+        #   - 출구 판단: 노란 '선 개수'(위상=색·크기 불변) 를 세서 2번째에 탈출
+        #   - odom/IMU 없음 → 개수 카운트가 주 신호, 시간은 안전 백스톱
         self.declare_parameter('yellow_topic', '/opencv/image/yellow')
         # 켜야만 회전로 FSM 동작. 기본 off → 기존 차선주행 무영향(안전).
         self.declare_parameter('roundabout_enabled', False)
         # 탈출/전환 방향: 정방향(빨강 왼쪽)=왼쪽(-1), 역방향(빨강 오른쪽)=오른쪽(+1).
         self.declare_parameter('branch_side', 1)
 
-        # --- 상태 전환 임계값 (ROI 내 픽셀 수) ---
-        # 진입: 노란 픽셀이 이 값 이상이면 링에 접근 → ENTER.
-        self.declare_parameter('yellow_enter_pixels', 150)
-        # 링 안착: 흰 픽셀이 이 값 이하로 떨어지면 본선 전환부를 벗어나 링 내부 → IN_LOOP.
-        self.declare_parameter('white_low_pixels', 60)
-        # FSM 종료: 노란 픽셀이 이 값 이하 = 링 완전히 벗어나 본선 복귀 → LANE_FOLLOW.
-        self.declare_parameter('yellow_gone_pixels', 40)
+        # --- 상태 전환: 픽셀 '비율'(해상도·크기 무관, sim→실차 이식) ---
+        # 진입: 노란 비율(yellow/(yellow+white))이 이 값 이상이면 링 접근 → ENTER.
+        self.declare_parameter('enter_yellow_ratio', 0.40)
+        # 링 안착: 흰 비율이 이 값 이하로 떨어지면 본선 벗어나 링 내부 → IN_LOOP.
+        self.declare_parameter('onring_white_ratio', 0.15)
+        # FSM 종료: 노란 비율이 이 값 이하 = 링 벗어나 본선 복귀 → LANE_FOLLOW.
+        self.declare_parameter('exit_yellow_ratio', 0.15)
+        # 비율을 신뢰할 최소 활성픽셀(ROI 면적 대비). 이보다 적으면 '아무것도 없음'.
+        self.declare_parameter('activity_floor_frac', 0.01)
 
-        # --- 출구(노란 junction) 카운트 ---
-        # 한 스캔행에서 노란 클러스터가 이 개수 이상이면 그 행은 'junction(분기)'로 본다.
-        # 평범한 링은 노란선 2개(=2 클러스터), 진입/출구 접합부는 3개 이상.
+        # --- 출구 랜드마크(노란 선 개수) 카운트 ---
+        # 한 스캔행에서 노란 클러스터가 이 개수 이상이면 그 행을 '출구 접합부'로 본다.
+        # 평범한 링은 노란선 2개, 출구 접합부는 3개 이상.(개수 = 색·크기 불변)
         self.declare_parameter('junction_min_clusters', 3)
-        # 스캔행 중 위 조건을 만족하는 행 비율이 이 값 이상이면 '지금 junction' 으로 판정.
+        # 스캔행 중 위 조건 만족 비율이 이 값 이상이면 '지금 출구 랜드마크'로 판정.
         self.declare_parameter('junction_rows_frac', 0.34)
-        # 탈출 전 스킵할 출구(junction) 개수. 1이면 첫 출구 통과·두 번째에서 탈출.
+        # 탈출 전 스킵할 출구 개수. 1이면 첫 출구 통과·두 번째에서 탈출(1회전 이상).
         self.declare_parameter('exits_to_skip', 1)
 
-        # --- 시간 백스톱(초) ---
-        # 카운트가 오작동해도 최소 이 시간 전엔 탈출 금지(조기탈출 방지).
-        self.declare_parameter('min_loop_sec', 3.0)
-        # 이 시간이 지나면 카운트와 무관하게 강제 탈출(무한 회전 방지).
-        self.declare_parameter('max_loop_sec', 25.0)
+        # --- 시간 백스톱(초) — 임계값이 어긋나 상태에 '갇히는' 것 방지 ---
+        self.declare_parameter('min_loop_sec', 3.0)       # 이 전엔 탈출 금지(조기탈출 방지)
+        self.declare_parameter('max_loop_sec', 25.0)      # 이 후엔 강제 탈출(무한회전 방지)
+        self.declare_parameter('enter_timeout_sec', 5.0)  # ENTER 갇힘 방지 → 강제 IN_LOOP
+        self.declare_parameter('exit_timeout_sec', 6.0)   # EXIT 갇힘 방지 → 강제 LANE_FOLLOW
 
-        # --- 전환부 조향 bias ---
-        # ENTER/EXIT 에서 목표 방향으로 offset 을 밀어준다(다중 노란선 오검출 회피).
-        # 실제 부호/세기는 시뮬 튜닝(음수 가능 = 반대쪽). side(branch_side)와 곱해짐.
+        # --- 노란 점선 잇기(모폴로지 닫힘) — '중앙잡기용'에만 국소 적용 ---
+        # 중앙잡기는 점선 이어야 안정적이지만, 출구 '개수 세기'는 원본이라야 3선이 안
+        # 뭉친다. 그래서 닫힘은 중앙잡기 입력에만 걸고, 카운트는 원본 노란으로 센다. 0=끔.
+        self.declare_parameter('yellow_close_ksize', 5)
+
+        # --- 전환부 조향 bias — 목표 방향으로 밀기(다중선 오검출 회피). 음수 가능 ---
         self.declare_parameter('enter_bias', 0.2)
         self.declare_parameter('exit_bias', 0.3)
-        # 상태전이/junction 판정 디바운스(연속 프레임 수).
+        # 상태전이/랜드마크 판정 디바운스(연속 프레임 수).
         self.declare_parameter('roundabout_debounce_frames', 2)
 
         # --- 내부 상태 ------------------------------------------------------
@@ -147,17 +151,21 @@ class LaneDetectionNode(Node):
         self.lane_width_px = None
 
         # --- 회전 교차로 FSM 상태 -------------------------------------------
-        self.latest_yellow = None        # 최신 노란색 마스크(ndarray, grayscale)
+        self.latest_yellow = None        # 최신 노란색 마스크(ndarray, grayscale, 원본)
+        self.lane_width_yellow = None    # 노란 링 차선폭(흰색과 분리 → handoff 오염 방지)
         self.rstate = 'LANE_FOLLOW'      # LANE_FOLLOW / ENTER / IN_LOOP / EXIT
         self.trans_counter = 0           # 상태전이 디바운스 카운터(상태 진입 시 0)
-        self.loop_enter_time = None      # IN_LOOP 진입 시각(시간 백스톱용)
-        self.junction_count = 0          # IN_LOOP 중 만난 출구(junction) 수
-        self.junction_active = False     # 지금 junction 위에 있나(중복 카운트 방지 래치)
-        self.junction_on = 0             # junction 감지 디바운스(rising)
-        self.junction_off = 0            # junction 해제 디바운스(falling)
+        self.state_enter_time = None     # 현재 상태 진입 시각(ENTER/EXIT 타임아웃용)
+        self.loop_enter_time = None      # IN_LOOP 진입 시각(min/max_loop 백스톱용)
+        self.junction_count = 0          # IN_LOOP 중 만난 출구 랜드마크 수
+        self.junction_active = False     # 지금 랜드마크 위에 있나(중복 카운트 방지 래치)
+        self.junction_on = 0             # 랜드마크 감지 디바운스(rising)
+        self.junction_off = 0            # 랜드마크 해제 디바운스(falling)
         # 디버그 로그용 최신 관측값(회전로 임계값 튜닝에 사용)
         self.dbg_white = 0
         self.dbg_yellow = 0
+        self.dbg_yr = 0.0
+        self.dbg_wr = 0.0
         self.dbg_jscore = 0.0
 
         image_qos = QoSProfile(
@@ -235,13 +243,23 @@ class LaneDetectionNode(Node):
         roi_left = min(max(int(self.get_parameter('roi_left').value), 0), width - 1)
         return roi_top, roi_left
 
-    def mask_counts(self, edge, yellow):
-        """ROI 안의 흰(edge)·노란 픽셀 수를 센다(상태 전환 판단용)."""
+    def lane_ratios(self, edge, yellow):
+        """ROI 안 흰/노란 픽셀의 '비율'을 반환한다(yellow_ratio, white_ratio).
+        절대 픽셀 수 대신 비율을 써서 해상도·크기(sim↔실차)에 안 휘둘리게 한다.
+        활성 픽셀이 바닥(ROI 면적 대비 activity_floor_frac) 미만이면 둘 다 0."""
         height, width = edge.shape
         roi_top, roi_left = self.roi_bounds(height, width)
         white_n = int(np.count_nonzero(edge[roi_top:, roi_left:]))
         yellow_n = int(np.count_nonzero(yellow[roi_top:, roi_left:]))
-        return white_n, yellow_n
+        roi_area = max(1, (height - roi_top) * (width - roi_left))
+        total = white_n + yellow_n
+        floor = float(self.get_parameter('activity_floor_frac').value) * roi_area
+        yr = 0.0 if total < floor else yellow_n / float(total)
+        wr = 0.0 if total < floor else white_n / float(total)
+        # 디버그 스태시(튜닝용)
+        self.dbg_white, self.dbg_yellow = white_n, yellow_n
+        self.dbg_yr, self.dbg_wr = yr, wr
+        return yr, wr
 
     def is_junction(self, yellow):
         """지금 화면이 회전로 '출구(분기)' junction 인지 판정한다.
@@ -272,15 +290,41 @@ class LaneDetectionNode(Node):
         return self.trans_counter >= need
 
     def set_state(self, new_state):
-        """FSM 상태를 바꾸고 전이 디바운스 카운터를 리셋한다."""
+        """FSM 상태를 바꾸고 전이 디바운스 카운터·상태진입 시각을 리셋한다."""
         self.rstate = new_state
         self.trans_counter = 0
+        self.state_enter_time = self.get_clock().now()
 
     def elapsed_in_loop(self):
         """IN_LOOP 진입 후 경과 시간(초). 시작 전이면 0."""
         if self.loop_enter_time is None:
             return 0.0
         return (self.get_clock().now() - self.loop_enter_time).nanoseconds * 1e-9
+
+    def elapsed_in_state(self):
+        """현재 상태 진입 후 경과 시간(초). ENTER/EXIT 갇힘 방지 타임아웃용."""
+        if self.state_enter_time is None:
+            return 0.0
+        return (self.get_clock().now() - self.state_enter_time).nanoseconds * 1e-9
+
+    def closed_yellow(self, yellow):
+        """중앙잡기용: 노란 점선을 모폴로지 닫힘으로 이어붙인 '사본'. 출구 개수 세기엔
+        원본 yellow 를 쓴다(닫힘이 3선을 뭉치는 자기모순 방지)."""
+        ksize = int(self.get_parameter('yellow_close_ksize').value)
+        if ksize <= 0:
+            return yellow
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+        return cv2.morphologyEx(yellow, cv2.MORPH_CLOSE, kernel)
+
+    def detect_on_yellow(self, yellow_closed):
+        """노란 마스크로 detect_lane 을 돌리되 차선폭 상태를 흰색과 분리한다(오염 방지).
+        학습되는 lane_width_px 를 잠깐 노란용으로 스왑했다가 되돌린다."""
+        saved = self.lane_width_px
+        self.lane_width_px = self.lane_width_yellow
+        result = self.detect_lane(yellow_closed)
+        self.lane_width_yellow = self.lane_width_px
+        self.lane_width_px = saved
+        return result
 
     def apply_side_bias(self, result, bias):
         """전환부에서 목표 방향(branch_side)으로 offset 을 밀어준다. 여러 노란선이
@@ -329,59 +373,59 @@ class LaneDetectionNode(Node):
         self.junction_active = False
 
     def roundabout_step(self, edge, yellow):
-        """회전 교차로 FSM. 흰(edge)/노란 마스크로 진입→링→출구를 처리한다.
+        """회전 교차로 FSM. 상태별로 흰/노란 마스크를 detect_lane 에 태워 처리한다.
 
-        LANE_FOLLOW : 흰 차선 주행. 노란 픽셀 급증 → ENTER.
-        ENTER       : 링안쪽 bias + 노란선 추종. 흰색 사라짐 → IN_LOOP(카운트 시작).
-        IN_LOOP     : 두 노란선 중앙 주행 + 출구(junction) 카운트.
+        LANE_FOLLOW : 흰 차선 주행. 노란 비율 급증 → ENTER.
+        ENTER       : 링안쪽 bias + 노란선 추종. 흰 비율 낮아짐(or 타임아웃) → IN_LOOP.
+        IN_LOOP     : 두 노란선 중앙 주행 + 출구 랜드마크 카운트.
                       (카운트 > exits_to_skip AND 시간≥min) 또는 시간≥max → EXIT.
-        EXIT        : 출구쪽 bias + 노란 램프 추종. 노란색 사라짐 → LANE_FOLLOW.
-        detect_lane 을 흰/노란 마스크에 그대로 태워 '두 선 중앙잡기'를 재사용한다."""
-        white_n, yellow_n = self.mask_counts(edge, yellow)
-        self.dbg_white, self.dbg_yellow = white_n, yellow_n  # 디버그용 스태시
-        enter_p = int(self.get_parameter('yellow_enter_pixels').value)
-        white_low = int(self.get_parameter('white_low_pixels').value)
-        yellow_gone = int(self.get_parameter('yellow_gone_pixels').value)
+        EXIT        : 출구쪽 bias + 노란 램프 추종. 노란 비율 낮아짐(or 타임아웃) → LANE_FOLLOW.
+        중앙잡기는 detect_on_yellow(닫힌 노란)로, 출구 카운트는 원본 yellow 로 한다."""
+        yr, wr = self.lane_ratios(edge, yellow)      # 비율(해상도 무관)
+        yc = self.closed_yellow(yellow)              # 중앙잡기용(닫힘). 카운트는 원본.
+        enter_yr = float(self.get_parameter('enter_yellow_ratio').value)
+        onring_wr = float(self.get_parameter('onring_white_ratio').value)
+        exit_yr = float(self.get_parameter('exit_yellow_ratio').value)
         exits_to_skip = int(self.get_parameter('exits_to_skip').value)
         min_loop = float(self.get_parameter('min_loop_sec').value)
         max_loop = float(self.get_parameter('max_loop_sec').value)
+        enter_to = float(self.get_parameter('enter_timeout_sec').value)
+        exit_to = float(self.get_parameter('exit_timeout_sec').value)
 
-        # ---- LANE_FOLLOW: 흰 차선 정상 주행, 노랑 급증 시 진입 ----
+        # ---- LANE_FOLLOW: 흰 차선 정상 주행, 노란 비율 급증 시 진입 ----
         if self.rstate == 'LANE_FOLLOW':
-            if self._trans(yellow_n >= enter_p):
+            if self._trans(yr >= enter_yr):
                 self.set_state('ENTER')
             return self.detect_lane(edge)
 
-        # ---- ENTER: 링 안쪽 bias + 노란선 추종. 흰색 사라지면 링 안착 ----
+        # ---- ENTER: 링 안쪽 bias + 노란선 추종. 흰 비율 낮아지면 링 안착 ----
+        # (임계값 어긋나도 enter_timeout_sec 지나면 강제로 IN_LOOP -> 갇힘 방지)
         if self.rstate == 'ENTER':
-            if self._trans(white_n <= white_low):
+            if self._trans(wr <= onring_wr) or self.elapsed_in_state() >= enter_to:
                 self.enter_loop()
             return self.apply_side_bias(
-                self.detect_lane(yellow),
+                self.detect_on_yellow(yc),
                 float(self.get_parameter('enter_bias').value),
             )
 
-        # ---- IN_LOOP: 두 노란선 중앙 주행 + 출구 카운트 ----
+        # ---- IN_LOOP: 두 노란선 중앙 주행 + 출구 랜드마크 카운트(원본 yellow) ----
         if self.rstate == 'IN_LOOP':
             self.update_junction_count(yellow)
             elapsed = self.elapsed_in_loop()
             take_exit = self.junction_count > exits_to_skip and elapsed >= min_loop
-            if take_exit or elapsed >= max_loop:
+            if take_exit or elapsed >= max_loop:   # max_loop = 무한회전 백스톱
                 self.set_state('EXIT')
-            return self.detect_lane(yellow)
+            return self.detect_on_yellow(yc)
 
-        # ---- EXIT: 출구 램프(노란) 따라 나가다 노란색 없어지면 본선 복귀 ----
-        # 진입과 대칭: 흰색으로 바로 안 넘기고, 노란 출구 램프를 따라가며 peel-off
-        # 하다가 노란색이 완전히 사라지면 그때 흰 본선(LANE_FOLLOW)으로 인계.
-        if self._trans(yellow_n <= yellow_gone):
+        # ---- EXIT: 출구 램프(노란) 따라 peel-off, 노란 비율 낮아지면 본선 복귀 ----
+        # 진입과 대칭. exit_timeout_sec 지나면 강제로 LANE_FOLLOW -> 갇힘 방지.
+        if self._trans(yr <= exit_yr) or self.elapsed_in_state() >= exit_to:
             self.reset_roundabout()
             return self.detect_lane(edge)
         return self.apply_side_bias(
-            self.detect_lane(yellow),
+            self.detect_on_yellow(yc),
             float(self.get_parameter('exit_bias').value),
         )
-
-    # --------------------------------------------------------------- detection
     def detect_lane(self, edge):
         """ROI 안에서 행별로 좌/우 차선 x좌표를 찾아 '그 순간'의 차선 중심과
         offset/confidence 를 계산한다. 시간 평활은 하지 않는다."""
@@ -653,6 +697,7 @@ class LaneDetectionNode(Node):
             self.get_logger().info(
                 f"rstate={self.rstate} jcnt={self.junction_count} "
                 f"jactive={int(self.junction_active)} jscore={self.dbg_jscore:.2f} "
+                f"yr={self.dbg_yr:.2f} wr={self.dbg_wr:.2f} "
                 f"white={self.dbg_white} yellow={self.dbg_yellow} "
                 f"lane_width_px={self.lane_width_px:.0f} "
                 f"L={int(result['left_detected'])} R={int(result['right_detected'])} "

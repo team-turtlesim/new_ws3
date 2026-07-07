@@ -64,11 +64,10 @@ class OpenCvNode(Node):
         self.declare_parameter('edge_color', 'white')
         # /opencv/image/yellow 로 노란색 전용 마스크를 따로 발행(lane_detection 이
         # 회전로 FSM 에 사용). edge 모드(Canny)에선 색 정보가 없어 발행 안 함.
+        # 원본(점선 안 이어붙인) 마스크를 발행한다 — 점선 잇기(모폴로지 닫힘)는
+        # lane_detection 에서 '중앙잡기 입력'에만 국소 적용하고, 출구 '선 개수 세기'
+        # 는 원본이라야 선이 안 뭉쳐 정확하다(닫힘↔카운트 자기모순 해소).
         self.declare_parameter('publish_yellow', True)
-        # 노란 점선(회전로 진입/출구 전환 마커) 조각을 이어붙일 모폴로지 닫힘 커널(px).
-        # 0=끔. 점선 빈칸에 가로줄 스캔이 흔들리는 것 방지. 너무 키우면 옆 선과
-        # 붙으니 작게(3~7) 시작해 시뮬에서 튜닝.
-        self.declare_parameter('yellow_close_ksize', 5)
 
         subscribe_topic = str(self.get_parameter('subscribe_topic').value)
         self.vehicle_config_file = os.path.expanduser(
@@ -158,8 +157,8 @@ class OpenCvNode(Node):
         임계값은 파라미터로 노출 -> venue 조명에서 라이브 튜닝 가능.
 
         흰색=본선 차선, 노란색=중앙 회전로. 회전로에서 진입/주행/탈출을 판단하려면
-        두 색을 합치지 말고 각각 돌려줘야 한다. 노란 마스크엔 점선 이어붙이기
-        (모폴로지 닫힘)를 걸어 진입/출구 전환부의 점선 검출을 안정화한다.
+        두 색을 합치지 말고 각각 돌려줘야 한다. 노란 마스크는 '원본'을 돌려준다
+        (점선 잇기는 lane_detection 이 중앙잡기용으로만 국소 적용).
         """
         hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
         gp = self.get_parameter
@@ -180,15 +179,9 @@ class OpenCvNode(Node):
             ], dtype=np.uint8),
             np.array([int(gp('yellow_h_max').value), 255, 255], dtype=np.uint8),
         )
-        # 점잡음 제거
+        # 점잡음 제거 (원본 노란 마스크 그대로 발행)
         white = cv2.medianBlur(white, 5)
         yellow = cv2.medianBlur(yellow, 5)
-
-        # 노란 점선(진입/출구 전환 마커) 조각을 모폴로지 닫힘으로 이어 실선처럼 만든다.
-        ksize = int(gp('yellow_close_ksize').value)
-        if ksize > 0:
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
-            yellow = cv2.morphologyEx(yellow, cv2.MORPH_CLOSE, kernel)
         return white, yellow
 
     def color_lane_mask(self, bgr):
