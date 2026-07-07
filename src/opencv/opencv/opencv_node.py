@@ -53,6 +53,23 @@ class OpenCvNode(Node):
         self.declare_parameter('yellow_s_min', 80)
         self.declare_parameter('yellow_v_min', 80)
 
+        # --- 회전 교차로(중앙 노란 링) 지원 -------------------------------
+        # 트랙은 색으로 길을 구분한다: 흰색=본선 차선, 노란색=회전로.
+        # 기존엔 white|yellow 를 OR 로 합쳐 하나로 냈지만, 회전로 진입/주행/탈출을
+        # 판단하려면 흰/노랑을 분리해야 한다.
+        #   edge_color: /opencv/image/edge 에 실을 마스크.
+        #     'white'(본선 차선만·기본) | 'yellow'(회전로만) | 'both'(기존처럼 합침)
+        #   평소 구간엔 노란색이 없어 white 와 both 가 같으므로 기본 white 로 둬도
+        #   기존 차선주행은 안 바뀐다(회전로 근처에서만 달라짐).
+        self.declare_parameter('edge_color', 'white')
+        # /opencv/image/yellow 로 노란색 전용 마스크를 따로 발행(lane_detection 이
+        # 회전로 FSM 에 사용). edge 모드(Canny)에선 색 정보가 없어 발행 안 함.
+        self.declare_parameter('publish_yellow', True)
+        # 노란 점선(회전로 진입/출구 전환 마커) 조각을 이어붙일 모폴로지 닫힘 커널(px).
+        # 0=끔. 점선 빈칸에 가로줄 스캔이 흔들리는 것 방지. 너무 키우면 옆 선과
+        # 붙으니 작게(3~7) 시작해 시뮬에서 튜닝.
+        self.declare_parameter('yellow_close_ksize', 5)
+
         subscribe_topic = str(self.get_parameter('subscribe_topic').value)
         self.vehicle_config_file = os.path.expanduser(
             str(self.get_parameter('vehicle_config_file').value)
@@ -60,6 +77,7 @@ class OpenCvNode(Node):
         self.jpeg_quality = int(self.get_parameter('jpeg_quality').value)
         self.debug_log = bool(self.get_parameter('debug_log').value)
         self.publish_debug_streams = bool(self.get_parameter('publish_debug_streams').value)
+        self.publish_yellow = bool(self.get_parameter('publish_yellow').value)
 
         if not 0 <= self.jpeg_quality <= 100:
             raise ValueError('jpeg_quality must be in range [0, 100]')
@@ -91,6 +109,13 @@ class OpenCvNode(Node):
             '/opencv/image/edge',
             image_qos,
         )
+        # 노란색 전용 마스크(회전로 FSM 용) -> 켜졌을 때만 퍼블리셔 생성.
+        self.yellow_pub = None
+        if self.publish_yellow:
+            self.yellow_pub = self.create_publisher(
+                CompressedImage, '/opencv/image/yellow', image_qos,
+            )
+
         # gray/blur 는 디버그용 -> 켜졌을 때만 퍼블리셔 생성.
         self.gray_pub = None
         self.blur_pub = None
@@ -125,12 +150,16 @@ class OpenCvNode(Node):
         height = int(config_data.get('LANE_PROC_HEIGHT', default_size[1]))
         return width, height
 
-    def color_lane_mask(self, bgr):
-        """흰색+노란색 차선만 남기는 이진 마스크(HSV 색 임계값).
+    def white_yellow_masks(self, bgr):
+        """흰색 차선 마스크와 노란색(회전로) 마스크를 '분리해서' 반환한다.
 
         Canny 는 모든 경계(그림자·트랙끝·다른 차)를 다 잡아 노이즈가 많지만,
         색 임계값은 차선 색만 골라내 더 안정적일 수 있다(대신 조명 변화에 민감).
         임계값은 파라미터로 노출 -> venue 조명에서 라이브 튜닝 가능.
+
+        흰색=본선 차선, 노란색=중앙 회전로. 회전로에서 진입/주행/탈출을 판단하려면
+        두 색을 합치지 말고 각각 돌려줘야 한다. 노란 마스크엔 점선 이어붙이기
+        (모폴로지 닫힘)를 걸어 진입/출구 전환부의 점선 검출을 안정화한다.
         """
         hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
         gp = self.get_parameter
@@ -151,10 +180,22 @@ class OpenCvNode(Node):
             ], dtype=np.uint8),
             np.array([int(gp('yellow_h_max').value), 255, 255], dtype=np.uint8),
         )
-        mask = cv2.bitwise_or(white, yellow)
         # 점잡음 제거
-        mask = cv2.medianBlur(mask, 5)
-        return mask
+        white = cv2.medianBlur(white, 5)
+        yellow = cv2.medianBlur(yellow, 5)
+
+        # 노란 점선(진입/출구 전환 마커) 조각을 모폴로지 닫힘으로 이어 실선처럼 만든다.
+        ksize = int(gp('yellow_close_ksize').value)
+        if ksize > 0:
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+            yellow = cv2.morphologyEx(yellow, cv2.MORPH_CLOSE, kernel)
+        return white, yellow
+
+    def color_lane_mask(self, bgr):
+        """흰색+노란색을 합친 이진 마스크(하위호환용). 신규 코드는
+        white_yellow_masks 로 분리해 쓰는 것을 권장."""
+        white, yellow = self.white_yellow_masks(bgr)
+        return cv2.bitwise_or(white, yellow)
 
     def to_compressed_msg(self, image, source_msg: CompressedImage, frame_id: str):
         ok, encoded = cv2.imencode(
@@ -196,11 +237,20 @@ class OpenCvNode(Node):
         gray = cv2.cvtColor(np_arr, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
 
-        # 차선 이진영상 생성: color 모드면 흰/노랑 색마스크, 아니면 Canny 엣지.
-        # 어느 쪽이든 lane_detection 은 동일하게 /opencv/image/edge 를 구독해 처리한다.
+        # 차선 이진영상 생성: color 모드면 흰/노랑 분리, 아니면 Canny 엣지.
+        # color 모드에선 edge_color 로 고른 마스크만 /edge 에 싣고, 노란색 전용
+        # 마스크는 /opencv/image/yellow 로 따로 보낸다(회전로 FSM 용).
         mode = str(self.get_parameter('detect_mode').value)
+        yellow_mask = None
         if mode == 'color':
-            edge = self.color_lane_mask(np_arr)
+            white_mask, yellow_mask = self.white_yellow_masks(np_arr)
+            edge_color = str(self.get_parameter('edge_color').value)
+            if edge_color == 'both':
+                edge = cv2.bitwise_or(white_mask, yellow_mask)
+            elif edge_color == 'yellow':
+                edge = yellow_mask
+            else:  # 'white'
+                edge = white_mask
         else:
             edge = cv2.Canny(blur, 50, 150)
 
@@ -208,6 +258,12 @@ class OpenCvNode(Node):
         if edge_msg is None:
             return
         self.edge_pub.publish(edge_msg)
+
+        # 노란색 전용 마스크 발행(color 모드에서만 존재).
+        if self.yellow_pub is not None and yellow_mask is not None:
+            yellow_msg = self.to_compressed_msg(yellow_mask, msg, frame_id='opencv_yellow')
+            if yellow_msg is not None:
+                self.yellow_pub.publish(yellow_msg)
 
         # gray/blur 는 디버그용 -> 켜졌을 때만 인코딩/발행(평소 CPU 절약).
         if self.publish_debug_streams:
