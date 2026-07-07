@@ -144,6 +144,16 @@ class LaneDetectionNode(Node):
         # 뭉친다. 그래서 닫힘은 중앙잡기 입력에만 걸고, 카운트는 원본 노란으로 센다. 0=끔.
         self.declare_parameter('yellow_close_ksize', 5)
 
+        # --- 진입 전용: 노란 점선 하나 따라가기(닫힌루프) ---
+        # 진입 직진 중엔 노란 '점선'만 보이고 반대편 실선은 잘 안 보인다(선 1개).
+        # 그때 '두 선 중앙잡기'는 성립 안 하므로, 보이는 그 선을 기준으로 링 안쪽으로
+        # entry_target_ratio 만큼 치우친 위치를 목표로 '따라가며' 커밋한다(고정각 아님→
+        # 자기보정 됨). 두 선이 다 보이면 자동으로 중앙잡기로 인계. False 면 옛 방식.
+        self.declare_parameter('enter_follow_single', True)
+        # 보이는 노란선 기준, 링 안쪽(branch_side 방향)으로 얼마나 치우쳐 따라갈지
+        # (half-width 대비 비율, 0~1). 클수록 더 확 꺾어 링으로 파고든다. 음수 가능.
+        self.declare_parameter('entry_target_ratio', 0.5)
+
         # --- 전환부 조향 bias — 목표 방향으로 밀기(다중선 오검출 회피). 음수 가능 ---
         self.declare_parameter('enter_bias', 0.2)
         self.declare_parameter('exit_bias', 0.3)
@@ -349,6 +359,35 @@ class LaneDetectionNode(Node):
         result['confidence'] = max(result['confidence'], 0.3)
         return result
 
+    def follow_dashed_into_ring(self, yc):
+        """진입 전용: 노란선 하나(주로 점선)를 기준으로 링 안쪽 목표 위치로 몰아간다.
+        진입 직진 중엔 반대편 실선이 잘 안 보여 선이 1개뿐 → '두 선 중앙잡기'가 성립
+        안 하므로, 보이는 선을 기준으로 링 안쪽(branch_side)으로 entry_target_ratio 만큼
+        치우친 위치를 목표로 따라간다(선 위치를 피드백으로 쓰는 닫힌루프 → 자기보정).
+        두 선이 다 보이면 링 안착 근처이므로 중앙잡기(+약한 bias)에 인계한다."""
+        result = self.detect_on_yellow(yc)
+        side = 1 if int(self.get_parameter('branch_side').value) >= 0 else -1
+        ld, rd = result['left_detected'], result['right_detected']
+        if ld and rd:
+            # 두 선 다 보임 → 중앙잡기 + 약한 링쪽 bias
+            return self.apply_side_bias(result, float(self.get_parameter('enter_bias').value))
+        # 단일 선: 검출된 선의 x 중앙값을 기준으로 링쪽 target offset 위치를 목표
+        pts = result['left_pts'] if ld else (result['right_pts'] if rd else [])
+        if not pts:
+            return result   # 아무 선도 없음: 그대로(offset 0)
+        width = result['image_width']
+        center_x = result['center_x']
+        line_x = float(np.median([x for _, x in pts]))
+        target = float(self.get_parameter('entry_target_ratio').value) * (width / 2.0)
+        lane_center = line_x + side * target       # 링 쪽으로 target 만큼 치우쳐 따라감
+        result = dict(result)
+        result['lane_center'] = lane_center
+        result['raw_offset'] = float(
+            np.clip((lane_center - center_x) / (width / 2.0), -1.0, 1.0))
+        result['left_detected'] = result['right_detected'] = True
+        result['confidence'] = max(result['confidence'], 0.3)
+        return result
+
     def update_junction_count(self, yellow):
         """IN_LOOP 중 출구(junction)를 rising-edge 로 카운트한다. junction 위에
         올라서는 '그 순간' 한 번만 +1(래치+디바운스)."""
@@ -408,12 +447,14 @@ class LaneDetectionNode(Node):
                 self.set_state('ENTER')
             return self.detect_lane(edge)
 
-        # ---- ENTER: 링 안쪽 bias + 노란선 추종. 흰 비율 낮아지면 링 안착 ----
+        # ---- ENTER: 노란 점선 따라 링으로 파고듦. 흰 비율 낮아지면 링 안착 ----
         # (임계값 어긋나도 enter_timeout_sec 지나면 강제로 IN_LOOP -> 갇힘 방지)
         if self.rstate == 'ENTER':
             if self._trans(wr <= onring_wr) or self.elapsed_in_state() >= enter_to:
                 self.enter_loop()
-            return self.apply_side_bias(
+            if bool(self.get_parameter('enter_follow_single').value):
+                return self.follow_dashed_into_ring(yc)      # 점선 따라가기(닫힌루프)
+            return self.apply_side_bias(                      # 옛 방식(두 선 중앙+bias)
                 self.detect_on_yellow(yc),
                 float(self.get_parameter('enter_bias').value),
             )
