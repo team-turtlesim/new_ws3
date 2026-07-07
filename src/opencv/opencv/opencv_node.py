@@ -62,6 +62,12 @@ class OpenCvNode(Node):
         #   평소 구간엔 노란색이 없어 white 와 both 가 같으므로 기본 white 로 둬도
         #   기존 차선주행은 안 바뀐다(회전로 근처에서만 달라짐).
         self.declare_parameter('edge_color', 'white')
+        # 입력 영상 채널 순서 보정. opencv 는 imdecode 결과를 BGR 로 가정하고
+        # cvtColor(BGR2HSV) 한다. 그런데 Gazebo 시뮬 카메라는 rgb8 을 주므로 R↔B 가
+        # 뒤바뀌어 '노란색(고 R·G)이 파란 hue 로 찍혀' HSV 노란 범위에 안 걸린다
+        # (흰색은 대칭이라 멀쩡 → "흰색만 되고 노란색만 안 됨" 증상). True 면 처리 전
+        # RGB→BGR 로 스왑. 실제 C920 카메라는 bgr8 이라 False(기본), sim 은 True 로.
+        self.declare_parameter('swap_rb', False)
         # /opencv/image/yellow 로 노란색 전용 마스크를 따로 발행(lane_detection 이
         # 회전로 FSM 에 사용). edge 모드(Canny)에선 색 정보가 없어 발행 안 함.
         # 원본(점선 안 이어붙인) 마스크를 발행한다 — 점선 잇기(모폴로지 닫힘)는
@@ -214,6 +220,11 @@ class OpenCvNode(Node):
         if np_arr is None:
             self.get_logger().warning('Failed to decode compressed image')
             return
+
+        # 채널 순서 보정: 입력이 RGB(예: Gazebo rgb8)면 BGR 로 스왑해야 이후
+        # cvtColor(BGR2HSV)/색마스크가 올바르다. 안 하면 노란색이 안 잡힘.
+        if bool(self.get_parameter('swap_rb').value):
+            np_arr = cv2.cvtColor(np_arr, cv2.COLOR_RGB2BGR)
 
         # 차선 처리 해상도로 다운스케일(카메라가 640x480 이어도 여기서 320x160 으로).
         # 이후 Canny/인코딩이 전부 저해상도에서 돌아 차선 튜닝값(ROI/px)이 그대로 유효.
