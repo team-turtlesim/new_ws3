@@ -116,6 +116,11 @@ class LaneDetectionNode(Node):
         self.declare_parameter('onring_white_ratio', 0.15)
         # FSM 종료: 노란 비율이 이 값 이하 = 링 벗어나 본선 복귀 → LANE_FOLLOW.
         self.declare_parameter('exit_yellow_ratio', 0.15)
+        # 출구는 '노랑→흰 합류'라 색전환 순간 흰선을 놓쳐 멈추기 쉽다. exit_use_both=True 면
+        # EXIT 에서 흰+노랑을 합쳐 따라가(색 바뀌어도 안 놓침), 흰 비율이 exit_white_ratio
+        # 이상으로 확보되면(=흰선 잡힘) 그때 LANE_FOLLOW 로 넘긴다.(진입은 발산이라 미적용)
+        self.declare_parameter('exit_use_both', True)
+        self.declare_parameter('exit_white_ratio', 0.50)
         # 비율을 신뢰할 최소 활성픽셀(ROI 면적 대비). 이보다 적으면 '아무것도 없음'.
         self.declare_parameter('activity_floor_frac', 0.01)
 
@@ -422,13 +427,19 @@ class LaneDetectionNode(Node):
                 self.set_state('EXIT')
             return self.detect_on_yellow(yc)
 
-        # ---- EXIT: 출구 램프(노란) 따라 peel-off, 노란 비율 낮아지면 본선 복귀 ----
-        # 진입과 대칭. exit_timeout_sec 지나면 강제로 LANE_FOLLOW -> 갇힘 방지.
-        if self._trans(yr <= exit_yr) or self.elapsed_in_state() >= exit_to:
+        # ---- EXIT: 노랑→흰 '합류'. 흰+노랑 합쳐 따라가 색전환에도 안 놓침 ----
+        # 흰 비율이 exit_white_ratio 이상(=흰선 확보) 또는 노랑 소멸/타임아웃 시 LANE_FOLLOW.
+        exit_wr = float(self.get_parameter('exit_white_ratio').value)
+        if (self._trans(wr >= exit_wr or yr <= exit_yr)
+                or self.elapsed_in_state() >= exit_to):
             self.reset_roundabout()
             return self.detect_lane(edge)
+        if bool(self.get_parameter('exit_use_both').value):
+            follow = cv2.bitwise_or(edge, yc)    # 흰+노랑 합침(합류 공백 제거)
+        else:
+            follow = yc                          # 노란 램프만
         return self.apply_side_bias(
-            self.detect_on_yellow(yc),
+            self.detect_lane(follow),
             float(self.get_parameter('exit_bias').value),
         )
     def detect_lane(self, edge):
