@@ -175,6 +175,10 @@ class LaneDetectionNode(Node):
         self.declare_parameter('exit_bias', 0.3)
         # 상태전이/랜드마크 판정 디바운스(연속 프레임 수).
         self.declare_parameter('roundabout_debounce_frames', 2)
+        # --- 2단계: 12시 가로 실선 마커 감지 ---
+        # 두 경계선 사이 '가운데 밴드'의 노란 채움 비율이 이 값 이상이면 마커 위로 본다.
+        # 평소 링 위에선 가운데가 검은 도로라 ~0, 12시 가로 실선을 지날 땐 노랑이 채워짐.
+        self.declare_parameter('marker_fill_ratio', 0.15)
 
         # --- 내부 상태 ------------------------------------------------------
         # 차선폭(px)은 기하 상태라 인지에 둔다. 양쪽 검출 시 EMA로 학습해
@@ -200,6 +204,12 @@ class LaneDetectionNode(Node):
         self.dbg_jscore = 0.0
         # 진입 실선 앵커의 직전 x (프레임 간 튐 방지 트래킹). LANE_FOLLOW 복귀 시 None.
         self.anchor_x_prev = None
+        # --- 2단계: 12시 가로 실선 마커 카운트 상태 ---
+        self.marker_count = 0            # 12시 마커 통과 횟수(랩 카운터)
+        self.marker_active = False       # 지금 마커 위인가(중복 카운트 방지 래치)
+        self.marker_on = 0               # 마커 감지 디바운스(rising)
+        self.marker_off = 0              # 마커 해제 디바운스(falling)
+        self.dbg_marker_score = 0.0      # 디버그: 가운데 밴드 노란 채움 비율
 
         image_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -660,6 +670,55 @@ class LaneDetectionNode(Node):
         elif self.junction_active and self.junction_off >= need:
             self.junction_active = False
 
+    def detect_center_marker(self, yellow):
+        """2단계: 12시 '가로지르는 실선 마커'를 감지한다.
+        두 경계선(맨왼쪽 + 한차선폭 이내 맨오른쪽) 사이 '가운데 밴드'의 노란 채움 비율을
+        잰다. 평소 링 위에선 가운데가 검은 도로라 ~0, 12시 가로 실선을 지날 땐 그 가운데가
+        노랑으로 채워져 비율이 확 오른다. 반환: 채움 비율(0~1). 경계 못 잡으면 0."""
+        yc = self.closed_yellow(yellow)
+        height, width = yc.shape
+        roi_top, roi_left = self.roi_bounds(height, width)
+        lines = sorted(self.detect_yellow_lines(yc), key=lambda ln: ln['bottom_x'])
+        if len(lines) < 2:
+            self.dbg_marker_score = 0.0
+            return 0.0
+        left = lines[0]
+        max_w = float(self.get_parameter('boundary_max_width_ratio').value) * width
+        cands = [ln for ln in lines if ln['bottom_x'] <= left['bottom_x'] + max_w]
+        right = cands[-1]
+        lx, rx = left['bottom_x'], right['bottom_x']
+        if rx - lx < 10:
+            self.dbg_marker_score = 0.0
+            return 0.0
+        # 경계에서 안쪽으로 margin 뗀 가운데 밴드(경계선 자체는 제외)
+        margin = 0.25 * (rx - lx)
+        x0 = int(max(roi_left, lx + margin))
+        x1 = int(min(width, rx - margin))
+        if x1 <= x0:
+            self.dbg_marker_score = 0.0
+            return 0.0
+        band = yc[roi_top:, x0:x1]
+        score = float(np.count_nonzero(band)) / float(max(1, band.size))
+        self.dbg_marker_score = score
+        return score
+
+    def update_marker_count(self, yellow):
+        """12시 마커를 rising-edge 로 카운트(랩 카운터). 마커 위에 올라서는 '그 순간'
+        한 번만 +1(래치+디바운스). marker_active 는 지금 마커 위인지."""
+        need = max(1, int(self.get_parameter('roundabout_debounce_frames').value))
+        thr = float(self.get_parameter('marker_fill_ratio').value)
+        if self.detect_center_marker(yellow) >= thr:
+            self.marker_on += 1
+            self.marker_off = 0
+        else:
+            self.marker_off += 1
+            self.marker_on = 0
+        if not self.marker_active and self.marker_on >= need:
+            self.marker_active = True
+            self.marker_count += 1
+        elif self.marker_active and self.marker_off >= need:
+            self.marker_active = False
+
     def enter_loop(self):
         """ENTER→IN_LOOP 전이. junction_active=True 로 두어 진입부에 아직 남아있는
         junction 을 출구로 오카운트하지 않게 한다(빠져나온 뒤부터 카운트)."""
@@ -669,12 +728,19 @@ class LaneDetectionNode(Node):
         self.junction_active = True
         self.junction_on = 0
         self.junction_off = 0
+        # 12시 마커 카운터 초기화(랩 세기 시작)
+        self.marker_count = 0
+        self.marker_active = False
+        self.marker_on = 0
+        self.marker_off = 0
 
     def reset_roundabout(self):
         """FSM 을 LANE_FOLLOW 로 되돌리고 회전 상태를 초기화."""
         self.set_state('LANE_FOLLOW')
         self.loop_enter_time = None
         self.junction_count = 0
+        self.marker_count = 0
+        self.marker_active = False
         self.junction_active = False
         self.anchor_x_prev = None
 
@@ -713,11 +779,12 @@ class LaneDetectionNode(Node):
             # 진입: 가장 연속적인 노란 실선 하나에 앵커해 branch_side 쪽으로 따라간다.
             return self.follow_solid_into_ring(yellow)
 
-        # ---- IN_LOOP(1단계): '맨왼쪽 + 한차선폭 이내 맨오른쪽' 두 선 정중앙 주행 ----
-        # 한 선 앵커(쏠림)·먼 곡선실선 오검출·가운데 점선 오선택을 한 번에 해결.
-        # (12시 마커 감지·카운트 기반 계속돎/탈출은 2·3단계에서 추가 예정)
+        # ---- IN_LOOP(1+2단계): 두 선 정중앙 주행 + 12시 마커 감지/카운트(주행 무변경) ----
+        # 2단계: update_marker_count 로 12시 가로 실선 마커를 세기만 한다(디버그로 확인).
+        # 주행은 1단계 그대로(follow_bounded_center). 마커 기반 계속돎/탈출은 3단계에서.
         if self.rstate == 'IN_LOOP':
             self.update_junction_count(yellow)   # (기존 탈출 트리거 유지)
+            self.update_marker_count(yellow)     # 2단계: 12시 마커 카운트(주행엔 미반영)
             elapsed = self.elapsed_in_loop()
             take_exit = self.junction_count > exits_to_skip and elapsed >= min_loop
             if take_exit or elapsed >= max_loop:   # max_loop = 무한회전 백스톱
@@ -1009,6 +1076,8 @@ class LaneDetectionNode(Node):
             lc = result['lane_center']
             self.get_logger().info(
                 f"rstate={self.rstate} jcnt={self.junction_count} "
+                f"mcnt={self.marker_count} mact={int(self.marker_active)} "
+                f"mscore={self.dbg_marker_score:.2f} "
                 f"jactive={int(self.junction_active)} jscore={self.dbg_jscore:.2f} "
                 f"yr={self.dbg_yr:.2f} wr={self.dbg_wr:.2f} "
                 f"white={self.dbg_white} yellow={self.dbg_yellow} "
