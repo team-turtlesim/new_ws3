@@ -165,6 +165,10 @@ class LaneDetectionNode(Node):
         # 안쪽 선 기준 '바깥쪽'으로 얼마나 치우쳐 돌지(half-width 대비 비율). 링 차로
         # 가운데를 유지하도록 반 링폭 정도. entry_target_ratio 와 별도로 튜닝.
         self.declare_parameter('loop_target_ratio', 0.5)
+        # 경계 선택 상한(이미지폭 대비). 맨 왼쪽 선에서 이 폭 이내의 가장 오른쪽 선을
+        # 오른쪽 경계로 삼는다. 도로폭(≈0.556)보다 여유롭게(≈1.3배) 잡아, 진입 접합부의
+        # 먼 곡선 실선(링 반대편)은 제외하되 올바른 오른쪽 점선은 포함되게 한다.
+        self.declare_parameter('boundary_max_width_ratio', 0.72)
 
         # --- 전환부 조향 bias — 목표 방향으로 밀기(다중선 오검출 회피). 음수 가능 ---
         self.declare_parameter('enter_bias', 0.2)
@@ -422,6 +426,48 @@ class LaneDetectionNode(Node):
             'right_poly': None,
         }
 
+    def follow_bounded_center(self, yellow):
+        """'맨 왼쪽 선'과 '거기서 한 차선폭 이내의 가장 오른쪽 선' 사이 정중앙을 따라간다.
+        - 두 선의 midpoint 라 항상 정확히 가운데 → 한쪽 쏠림 없음(단일선 앵커 폐기).
+        - 오른쪽 경계를 'boundary_max_width_ratio×폭' 이내로 제한 → 진입 접합부의 먼
+          곡선 실선(링 반대편)은 제외, 올바른 오른쪽 점선만 포함. 가운데 비스듬 점선도
+          '상한 내 맨오른쪽'이라 밀려서 제외됨.
+        - 점선은 닫힘(closed)으로 이어 붙여 flicker(비틀거림) 제거.
+        - 선이 하나뿐이면 그 선 기준 반 차선폭만큼 도로 안쪽으로 폴백."""
+        yc = self.closed_yellow(yellow)
+        height, width = yc.shape
+        center_x = width / 2.0
+        lines = sorted(self.detect_yellow_lines(yc), key=lambda ln: ln['bottom_x'])
+        if not lines:
+            return self._make_result(width, height, center_x, 0.0, None, [])
+        left = lines[0]                                    # 맨 왼쪽 = 좌 경계
+        max_w = float(self.get_parameter('boundary_max_width_ratio').value) * width
+        cands = [ln for ln in lines if ln['bottom_x'] <= left['bottom_x'] + max_w]
+        right = cands[-1]                                  # 상한 내 가장 오른쪽 = 우 경계
+        if right is left:
+            # 상한 안에 다른 선이 없음(사실상 단일선): 반 차선폭만큼 도로 안쪽으로
+            target = float(self.get_parameter('loop_target_ratio').value) * (width / 2.0)
+            side = 1.0 if left['bottom_x'] <= center_x else -1.0
+            lane_center = left['bottom_x'] + side * target
+            raw_offset = float(np.clip((lane_center - center_x) / (width / 2.0), -1.0, 1.0))
+            return self._make_result(width, height, center_x, raw_offset, lane_center, left['pts'])
+        lane_center = 0.5 * (left['bottom_x'] + right['bottom_x'])
+        raw_offset = float(np.clip((lane_center - center_x) / (width / 2.0), -1.0, 1.0))
+        return {
+            'raw_offset': raw_offset,
+            'left_detected': True,
+            'right_detected': True,
+            'confidence': 0.6,
+            'lane_center': lane_center,
+            'center_x': center_x,
+            'image_width': int(width),
+            'image_height': int(height),
+            'left_pts': left['pts'],
+            'right_pts': right['pts'],
+            'left_poly': None,
+            'right_poly': None,
+        }
+
     def detect_yellow_lines(self, mask):
         """노란 마스크에서 세로선(차선)들을 '개수 제한 없이' 각각 분리한다.
         scan_lanes 는 좌/우 딱 2선을 가정하지만, 진입로엔 점선+실선+링선이 겹쳐
@@ -667,20 +713,16 @@ class LaneDetectionNode(Node):
             # 진입: 가장 연속적인 노란 실선 하나에 앵커해 branch_side 쪽으로 따라간다.
             return self.follow_solid_into_ring(yellow)
 
-        # ---- IN_LOOP: 두 노란선 중앙 주행 + 출구 랜드마크 카운트(원본 yellow) ----
+        # ---- IN_LOOP(1단계): '맨왼쪽 + 한차선폭 이내 맨오른쪽' 두 선 정중앙 주행 ----
+        # 한 선 앵커(쏠림)·먼 곡선실선 오검출·가운데 점선 오선택을 한 번에 해결.
+        # (12시 마커 감지·카운트 기반 계속돎/탈출은 2·3단계에서 추가 예정)
         if self.rstate == 'IN_LOOP':
-            self.update_junction_count(yellow)
+            self.update_junction_count(yellow)   # (기존 탈출 트리거 유지)
             elapsed = self.elapsed_in_loop()
             take_exit = self.junction_count > exits_to_skip and elapsed >= min_loop
             if take_exit or elapsed >= max_loop:   # max_loop = 무한회전 백스톱
                 self.set_state('EXIT')
-            # 평상시(진입로 직진·링 직선부)엔 흰색과 '동일한' 중앙잡기(detect_lane)를
-            # 노란 마스크에 그대로 적용 → 색 구별 없이 두 선 사이 가운데 주행(안정적).
-            # 단, 출구(junction) 위에 올라선 순간엔 바깥 선이 갈라져 중앙잡기가 출구로
-            # 끌려가므로, 그때만 안쪽 선 앵커(follow_ring)로 이탈을 버틴다.
-            if self.junction_active:
-                return self.follow_ring(yellow)
-            return self.detect_on_yellow(yc)
+            return self.follow_bounded_center(yellow)
 
         # ---- EXIT: 노랑→흰 '합류'. 흰+노랑 합쳐 따라가 색전환에도 안 놓침 ----
         # 흰 비율이 exit_white_ratio 이상(=흰선 확보) 또는 노랑 소멸/타임아웃 시 LANE_FOLLOW.
