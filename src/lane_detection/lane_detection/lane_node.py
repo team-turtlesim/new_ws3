@@ -134,7 +134,10 @@ class LaneDetectionNode(Node):
         self.declare_parameter('exits_to_skip', 1)
 
         # --- 시간 백스톱(초) — 임계값이 어긋나 상태에 '갇히는' 것 방지 ---
-        # A안: IN_LOOP 진입 후 이 시간(≈한 바퀴 도는 시간) 지나면 EXIT 로 전환한다.
+        # 진입로(ENTER) 통과 시간(초). 이 동안은 순수 중앙잡기(가드 OFF)로 진입로를
+        # 지나 오른쪽 쏠림을 없애고, 지나면 원(IN_LOOP)으로 전환한다. 실측으로 튜닝.
+        self.declare_parameter('approach_sec', 3.0)
+        # IN_LOOP(원) 진입 후 이 시간(≈한 바퀴 도는 시간) 지나면 EXIT 로 전환한다.
         # 실측 랩타임에 맞춰 튜닝(너무 짧으면 덜 돌고 나가고, 너무 길면 더 돈 뒤 나감).
         self.declare_parameter('min_loop_sec', 8.0)
         self.declare_parameter('max_loop_sec', 25.0)      # (미사용, B안/백스톱 대비 보존)
@@ -512,13 +515,15 @@ class LaneDetectionNode(Node):
         raw_offset = (lane_center - center_x) / (width / 2.0)
         return self._make_result(width, height, center_x, raw_offset, lane_center, anchor['pts'])
 
-    def follow_ring(self, yellow):
-        """IN_LOOP(원 주행): '안쪽 중앙섬 선'에 앵커해 한 바퀴 돈다.
-        원은 바깥 선이 출구마다 갈라져 열리므로 바깥을 따라가면 출구로 끌려나간다.
-        안쪽 중앙섬 선은 닫힌 원이라 출구에서도 안 끊긴다 → 안쪽에 앵커하고 바깥쪽으로
-        반 링폭 오프셋해 링 차로를 유지하면, 출구는 바깥쪽으로 지나가고 안 끌려나간다.
-        loop_inner_side: +1=중앙섬 오른쪽(바깥/출구 왼쪽) → 가장 오른쪽 선을 안쪽으로
-        보고 앵커, -1=반대. 라이브로 뒤집어 트랙 회전방향에 맞춘다."""
+    def follow_ring(self, yellow, anchor_side=None):
+        """한쪽 극단의 노란 실선 하나에 앵커해 따라간다(가장자리에서 도로 안쪽으로
+        반 링폭 오프셋).
+          - IN_LOOP(원 주행): anchor_side=안쪽(loop_inner_side) → 안쪽 중앙섬 선은
+            닫힌 원이라 출구서 안 갈라짐 → 안 끌려나가고 계속 돎.
+          - EXIT(탈출): anchor_side=바깥(-loop_inner_side) → 바깥 선은 출구서 갈라져
+            나가므로 그 선을 따라 밖으로 빠져나간다.
+        anchor_side 미지정 시 loop_inner_side(안쪽) 사용. loop_inner_side +1=중앙섬이
+        오른쪽(바깥/출구 왼쪽). 라이브로 뒤집어 트랙 회전방향에 맞춘다."""
         yc = self.closed_yellow(yellow)   # 링 선은 실선이라 닫힘으로 안정화
         height, width = yc.shape
         center_x = width / 2.0
@@ -530,27 +535,28 @@ class LaneDetectionNode(Node):
         )
         solid = [ln for ln in lines if ln['coverage'] >= solid_min]
         pool = solid if solid else lines
-        inner_side = 1 if int(self.get_parameter('loop_inner_side').value) >= 0 else -1
+        if anchor_side is None:
+            anchor_side = 1 if int(self.get_parameter('loop_inner_side').value) >= 0 else -1
 
-        def innermost(cands):
-            # 중앙섬 쪽(inner_side)으로 가장 치우친 선 = 안쪽 선.
-            return (max(cands, key=lambda ln: ln['bottom_x']) if inner_side > 0
+        def extreme(cands):
+            # anchor_side 쪽으로 가장 치우친 선(+1=가장 오른쪽, -1=가장 왼쪽).
+            return (max(cands, key=lambda ln: ln['bottom_x']) if anchor_side > 0
                     else min(cands, key=lambda ln: ln['bottom_x']))
 
-        # 튐 방지: 직전 앵커에 가장 가까운 선 우선, 너무 멀면 안쪽 극단으로 재획득.
+        # 튐 방지: 직전 앵커에 가장 가까운 선 우선, 너무 멀면 anchor_side 극단으로 재획득.
         if self.anchor_x_prev is not None:
             anchor = min(pool, key=lambda ln: abs(ln['bottom_x'] - self.anchor_x_prev))
             if abs(anchor['bottom_x'] - self.anchor_x_prev) > float(
                     self.get_parameter('track_tol_px').value):
-                anchor = innermost(pool)
+                anchor = extreme(pool)
         else:
-            anchor = innermost(pool)
+            anchor = extreme(pool)
         self.anchor_x_prev = anchor['bottom_x']
 
         line_x = anchor['bottom_x']
         target = float(self.get_parameter('loop_target_ratio').value) * (width / 2.0)
-        # 안쪽 선에서 '바깥쪽'(중앙섬 반대)으로 오프셋 → 링 차로 가운데 유지.
-        lane_center = line_x - inner_side * target
+        # 앵커한 가장자리 선에서 '도로 안쪽'(anchor_side 반대)으로 오프셋 → 차로 유지.
+        lane_center = line_x - anchor_side * target
         raw_offset = float(np.clip((lane_center - center_x) / (width / 2.0), -1.0, 1.0))
         return self._make_result(width, height, center_x, raw_offset, lane_center, anchor['pts'])
 
@@ -657,6 +663,7 @@ class LaneDetectionNode(Node):
         self.junction_active = True
         self.junction_on = 0
         self.junction_off = 0
+        self.anchor_x_prev = None   # 원(안쪽선) 앵커 새로 획득
 
     def reset_roundabout(self):
         """FSM 을 LANE_FOLLOW 로 되돌리고 회전 상태를 초기화."""
@@ -693,36 +700,31 @@ class LaneDetectionNode(Node):
                 self.set_state('ENTER')
             return self.detect_lane(edge)
 
-        # ---- ENTER: 노란 점선 따라 링으로 파고듦. 흰 비율 낮아지면 링 안착 ----
-        # (임계값 어긋나도 enter_timeout_sec 지나면 강제로 IN_LOOP -> 갇힘 방지)
+        # ---- ENTER(진입로): 순수 중앙잡기(가드 OFF). approach_sec 지나면 원으로 ----
+        # 진입로엔 점선이 있어 오른선 앵커를 켜면 오른쪽으로 쏠린다. 그래서 여기선
+        # 흰색과 동일한 중앙잡기로 두 선 사이 가운데를 지나고, approach_sec 뒤 원 진입.
         if self.rstate == 'ENTER':
-            if self._trans(wr <= onring_wr) or self.elapsed_in_state() >= enter_to:
+            if self.elapsed_in_state() >= float(self.get_parameter('approach_sec').value):
                 self.enter_loop()
-            # 진입: 가장 연속적인 노란 실선 하나에 앵커해 branch_side 쪽으로 따라간다.
-            return self.follow_solid_into_ring(yellow)
+            return self.detect_on_yellow(yc)
 
-        # ---- IN_LOOP: 두 노란선 중앙 주행 + 출구 랜드마크 카운트(원본 yellow) ----
+        # ---- IN_LOOP(원): 안쪽(오른쪽)선만 앵커해 돎. min_loop 지나면 탈출 ----
+        # 안쪽 중앙섬 선은 닫힌 원이라 출구서 안 갈라짐 → 안 끌려나가고 계속 돎.
         if self.rstate == 'IN_LOOP':
-            self.update_junction_count(yellow)   # 카운트 유지(B안/디버그 대비)
-            # A안 탈출 트리거: 시간으로 ≥1바퀴 보장(min_loop_sec) 후 EXIT 로 전환.
-            # EXIT 에서 안쪽 가드레일을 풀면 중앙잡기가 다음 출구 개구부에서 자연히 나간다.
-            if self.elapsed_in_loop() >= min_loop:
+            if self.elapsed_in_loop() >= min_loop:   # ≈한 바퀴 시간 → 탈출
                 self.set_state('EXIT')
-            # 진입로 직진·링 직선부: 흰색과 '동일한' 중앙잡기(detect_lane)를 노란 마스크에
-            # 그대로 적용 → 색 구별 없이 두 선 사이 가운데 주행. 여기에 '안쪽 가드레일'을
-            # 걸어, 출구에서 바깥 선이 갈라져도 링차로 중앙보다 바깥으로 못 끌려가게 막는다.
-            return self.guard_inner(self.detect_on_yellow(yc), yellow)
+                self.anchor_x_prev = None             # EXIT 에서 바깥선 재획득
+            return self.follow_ring(yellow)           # anchor_side=None → 안쪽선
 
-        # ---- EXIT: 안쪽 가드레일을 풀고 중앙잡기 → 갈라진 바깥선 따라 출구로 나감 ----
+        # ---- EXIT: 바깥선만 앵커 → 출구서 갈라진 바깥선을 따라 밖으로 나감 ----
         # 흰선 확보(wr↑) 또는 노랑 소멸(yr↓) 또는 타임아웃이면 본선(LANE_FOLLOW) 복귀.
         exit_wr = float(self.get_parameter('exit_white_ratio').value)
         if (self._trans(wr >= exit_wr or yr <= exit_yr)
                 or self.elapsed_in_state() >= exit_to):
             self.reset_roundabout()
             return self.detect_lane(edge)
-        # 가드 없는 중앙잡기: 링 직선부에선 그대로 돌다, 출구 개구부에서 갈라진 바깥선을
-        # 따라 자연히 밖으로 나간다(IN_LOOP 와 달리 guard_inner 를 안 건다).
-        return self.detect_on_yellow(yc)
+        inner_side = 1 if int(self.get_parameter('loop_inner_side').value) >= 0 else -1
+        return self.follow_ring(yellow, anchor_side=-inner_side)   # 바깥선 따라 탈출
     def detect_lane(self, edge):
         """ROI 안에서 행별로 좌/우 차선 x좌표를 찾아 '그 순간'의 차선 중심과
         offset/confidence 를 계산한다. 시간 평활은 하지 않는다."""
