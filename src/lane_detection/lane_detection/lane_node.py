@@ -944,7 +944,14 @@ class LaneDetectionNode(Node):
         self.detection_pub.publish(detection)
 
         if self.debug_pub is not None:
-            self.publish_debug(edge, result, msg)
+            # 회전로 상태(ENTER/IN_LOOP/EXIT)에선 노란선을 따라가므로 디버그 배경을
+            # 흰+노랑 합친 마스크로 그린다 → 빨간 앵커가 '어느 노란선'을 물었는지 보임.
+            # (기존엔 흰 마스크 위에만 그려 노란선이 안 보였음)
+            debug_base = edge
+            if (self.rstate in ('ENTER', 'IN_LOOP', 'EXIT') and yellow is not None
+                    and yellow.shape == edge.shape):
+                debug_base = cv2.bitwise_or(edge, self.closed_yellow(yellow))
+            self.publish_debug(debug_base, result, msg)
 
         # 회전로 튜닝: 닫힘 적용된 노란 마스크를 발행(점선 이어짐 확인용).
         if (self.yellow_closed_pub is not None and yellow is not None
