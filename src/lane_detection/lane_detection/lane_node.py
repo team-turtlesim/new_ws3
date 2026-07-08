@@ -494,12 +494,10 @@ class LaneDetectionNode(Node):
 
         line_x = anchor['bottom_x']  # 근거리 x 기준(조향 반응성)
         target = float(self.get_parameter('entry_target_ratio').value) * (width / 2.0)
-        # 오프셋 방향은 '도로 중앙 쪽'으로 적응: 앵커선이 중심보다 왼쪽이면 오른쪽으로,
-        # 오른쪽이면 왼쪽으로 반 차선폭만큼 밀어 도로 가운데를 유지한다. 어느 선을 잡든
-        # 한쪽에 안 붙고, 선이 굽으면 따라 굽어 자연히 링으로 들어간다. (고정 branch_side
-        # 는 오른쪽 선을 잡을 때 도로 밖으로 밀어 이탈시키던 문제가 있었음)
-        center_side = 1.0 if line_x <= center_x else -1.0
-        lane_center = line_x + center_side * target
+        # 앵커한 선을 branch_side 쪽으로 target 만큼 치우쳐 따라간다(라이브로 방향 조정
+        # 가능: +1=오른쪽, -1=왼쪽). 진입로 방향에 맞춰 branch_side 로 부호를 맞춘다.
+        side = 1.0 if int(self.get_parameter('branch_side').value) >= 0 else -1.0
+        lane_center = line_x + side * target
         raw_offset = (lane_center - center_x) / (width / 2.0)
         return self._make_result(width, height, center_x, raw_offset, lane_center, anchor['pts'])
 
@@ -615,8 +613,8 @@ class LaneDetectionNode(Node):
         if self.rstate == 'ENTER':
             if self._trans(wr <= onring_wr) or self.elapsed_in_state() >= enter_to:
                 self.enter_loop()
-            # 진입: 두 실선이 깔끔하면 중앙잡기, 난잡하면 단일 실선 앵커로 자동 전환.
-            return self.follow_yellow(yellow)
+            # 진입: 가장 연속적인 노란 실선 하나에 앵커해 branch_side 쪽으로 따라간다.
+            return self.follow_solid_into_ring(yellow)
 
         # ---- IN_LOOP: 두 노란선 중앙 주행 + 출구 랜드마크 카운트(원본 yellow) ----
         if self.rstate == 'IN_LOOP':
@@ -625,9 +623,8 @@ class LaneDetectionNode(Node):
             take_exit = self.junction_count > exits_to_skip and elapsed >= min_loop
             if take_exit or elapsed >= max_loop:   # max_loop = 무한회전 백스톱
                 self.set_state('EXIT')
-            # 링 주행도 같은 하이브리드로: 두 노란선이 깔끔하면 중앙잡기(원래 설계),
-            # 난잡하면 단일 실선 앵커. '한 바퀴 완주 후 출구 탈출' 정밀화는 다음 단계.
-            return self.follow_yellow(yellow)
+            # 링 주행도 같은 실선 앵커로. '한 바퀴 완주 후 출구 탈출' 정밀화는 다음 단계.
+            return self.follow_solid_into_ring(yellow)
 
         # ---- EXIT: 노랑→흰 '합류'. 흰+노랑 합쳐 따라가 색전환에도 안 놓침 ----
         # 흰 비율이 exit_white_ratio 이상(=흰선 확보) 또는 노랑 소멸/타임아웃 시 LANE_FOLLOW.
