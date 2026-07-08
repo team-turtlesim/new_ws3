@@ -467,8 +467,8 @@ class LaneDetectionNode(Node):
         없앤다:
           - 각 선의 행 커버리지로 실선을 고르고(점선은 깜빡여 커버리지 낮음),
           - 직전 앵커 x 에 가장 가까운 선으로 유지(프레임 간 튐 방지),
-          - 그 선을 branch_side 쪽으로 entry_target_ratio 만큼 치우쳐 따라가 링으로
-            파고든다(닫힌루프 → 자기보정).
+          - 그 선에서 '도로 중앙 쪽'으로 entry_target_ratio 만큼(반 차선폭) 치우쳐
+            따라간다(닫힌루프 → 자기보정). 선이 굽으면 따라 굽어 자연히 링으로 진입.
         color/해상도 대신 '연속성+위치'로만 판단해 sim↔실차 이식성을 유지한다.
         원본(닫힘 미적용) yellow 를 쓴다 — 닫으면 점선이 메워져 실선과 구분이 안 됨."""
         height, width = yellow.shape
@@ -476,7 +476,6 @@ class LaneDetectionNode(Node):
         lines = self.detect_yellow_lines(yellow)
         if not lines:
             return self._make_result(width, height, center_x, 0.0, None, [])
-        side = 1 if int(self.get_parameter('branch_side').value) >= 0 else -1
         solid_min = (
             float(self.get_parameter('solid_min_coverage_ratio').value) * self.num_scan_rows
         )
@@ -495,7 +494,12 @@ class LaneDetectionNode(Node):
 
         line_x = anchor['bottom_x']  # 근거리 x 기준(조향 반응성)
         target = float(self.get_parameter('entry_target_ratio').value) * (width / 2.0)
-        lane_center = line_x + side * target       # 링 쪽으로 target 만큼 치우쳐 따라감
+        # 오프셋 방향은 '도로 중앙 쪽'으로 적응: 앵커선이 중심보다 왼쪽이면 오른쪽으로,
+        # 오른쪽이면 왼쪽으로 반 차선폭만큼 밀어 도로 가운데를 유지한다. 어느 선을 잡든
+        # 한쪽에 안 붙고, 선이 굽으면 따라 굽어 자연히 링으로 들어간다. (고정 branch_side
+        # 는 오른쪽 선을 잡을 때 도로 밖으로 밀어 이탈시키던 문제가 있었음)
+        center_side = 1.0 if line_x <= center_x else -1.0
+        lane_center = line_x + center_side * target
         raw_offset = (lane_center - center_x) / (width / 2.0)
         return self._make_result(width, height, center_x, raw_offset, lane_center, anchor['pts'])
 
