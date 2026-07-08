@@ -153,6 +153,9 @@ class LaneDetectionNode(Node):
         # 보이는 노란선 기준, 링 안쪽(branch_side 방향)으로 얼마나 치우쳐 따라갈지
         # (half-width 대비 비율, 0~1). 클수록 더 확 꺾어 링으로 파고든다. 음수 가능.
         self.declare_parameter('entry_target_ratio', 0.5)
+        # 실선 판정: 한 선이 걸린 스캔행 수 / num_scan_rows 가 이 비율 이상이면 연속
+        # 실선으로 본다. 점선은 깜빡여 커버리지가 낮으므로 실선 앵커 선택에서 밀린다.
+        self.declare_parameter('solid_min_coverage_ratio', 0.5)
 
         # --- 전환부 조향 bias — 목표 방향으로 밀기(다중선 오검출 회피). 음수 가능 ---
         self.declare_parameter('enter_bias', 0.2)
@@ -182,6 +185,8 @@ class LaneDetectionNode(Node):
         self.dbg_yr = 0.0
         self.dbg_wr = 0.0
         self.dbg_jscore = 0.0
+        # 진입 실선 앵커의 직전 x (프레임 간 튐 방지 트래킹). LANE_FOLLOW 복귀 시 None.
+        self.anchor_x_prev = None
 
         image_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -388,6 +393,112 @@ class LaneDetectionNode(Node):
         result['confidence'] = max(result['confidence'], 0.3)
         return result
 
+    def _make_result(self, width, height, center_x, raw_offset, lane_center, pts):
+        """앵커 추종 결과를 detect_lane 과 동일한 dict 형식으로 만든다.
+        좌/우 모두 검출로 표기(하류 interpret 가 단독선 축소 없이 offset 을 그대로
+        쓰게)하고, 선이 잡히면 confidence 에 바닥(0.5)을 줘 회전로 중 lane-lost
+        오정지(interpret 페일세이프)를 막는다."""
+        return {
+            'raw_offset': float(np.clip(raw_offset, -1.0, 1.0)),
+            'left_detected': bool(pts),
+            'right_detected': bool(pts),
+            'confidence': 0.5 if pts else 0.0,
+            'lane_center': lane_center,
+            'center_x': center_x,
+            'image_width': int(width),
+            'image_height': int(height),
+            'left_pts': pts,
+            'right_pts': [],
+            'left_poly': None,
+            'right_poly': None,
+        }
+
+    def detect_yellow_lines(self, mask):
+        """노란 마스크에서 세로선(차선)들을 '개수 제한 없이' 각각 분리한다.
+        scan_lanes 는 좌/우 딱 2선을 가정하지만, 진입로엔 점선+실선+링선이 겹쳐
+        3개 이상 나온다. 여기선 모든 선을 뽑고 각 선의 '행 커버리지'(연속성)를 재
+        실선(높은 커버리지)과 점선(낮은 커버리지)을 구분할 수 있게 한다.
+        반환: [{'median_x','bottom_x','coverage','pts'}...] (근거리→원거리 추적)."""
+        height, width = mask.shape
+        roi_top, roi_left = self.roi_bounds(height, width)
+        scan_ys = sorted(
+            {int(v) for v in np.linspace(roi_top, height - 1, self.num_scan_rows)},
+            reverse=True,
+        )
+        cluster_gap = float(self.get_parameter('cluster_gap_px').value)
+        track_tol = float(self.get_parameter('track_tol_px').value)
+        lines = []  # 각 선: {'ref': 직전행 x, 'pts': [(y,x)...]}
+        for y in scan_ys:  # 근거리(하단)부터 위로 추적
+            clusters = self.row_clusters(mask[y], roi_left, cluster_gap)
+            used = set()
+            # 1) 기존 선들을 가장 가까운 미사용 클러스터에 tol 내에서 매칭
+            for ln in lines:
+                best_d, best_j = track_tol + 1.0, None
+                for j, c in enumerate(clusters):
+                    if j in used:
+                        continue
+                    d = abs(c[0] - ln['ref'])
+                    if d < best_d:
+                        best_d, best_j = d, j
+                if best_j is not None and best_d <= track_tol:
+                    ln['ref'] = clusters[best_j][0]
+                    ln['pts'].append((y, int(round(clusters[best_j][0]))))
+                    used.add(best_j)
+            # 2) 매칭 안 된 클러스터는 새 선으로 시작
+            for j, c in enumerate(clusters):
+                if j not in used:
+                    lines.append({'ref': c[0], 'pts': [(y, int(round(c[0])))]})
+        out = []
+        for ln in lines:
+            pts = ln['pts']
+            xs = [x for _, x in pts]
+            bottom_x = max(pts, key=lambda p: p[0])[1]  # 가장 아래(근거리) x
+            out.append({
+                'median_x': float(np.median(xs)),
+                'bottom_x': float(bottom_x),
+                'coverage': len(pts),
+                'pts': pts,
+            })
+        return out
+
+    def follow_solid_into_ring(self, yellow):
+        """진입로/링에서 '가장 연속적인(=실선) 노란선 하나'에 앵커해 따라간다.
+        다중선(점선+실선+링선)일 때 좌/우 짝짓기가 매 프레임 튀어 이탈하던 문제를
+        없앤다:
+          - 각 선의 행 커버리지로 실선을 고르고(점선은 깜빡여 커버리지 낮음),
+          - 직전 앵커 x 에 가장 가까운 선으로 유지(프레임 간 튐 방지),
+          - 그 선을 branch_side 쪽으로 entry_target_ratio 만큼 치우쳐 따라가 링으로
+            파고든다(닫힌루프 → 자기보정).
+        color/해상도 대신 '연속성+위치'로만 판단해 sim↔실차 이식성을 유지한다.
+        원본(닫힘 미적용) yellow 를 쓴다 — 닫으면 점선이 메워져 실선과 구분이 안 됨."""
+        height, width = yellow.shape
+        center_x = width / 2.0
+        lines = self.detect_yellow_lines(yellow)
+        if not lines:
+            return self._make_result(width, height, center_x, 0.0, None, [])
+        side = 1 if int(self.get_parameter('branch_side').value) >= 0 else -1
+        solid_min = (
+            float(self.get_parameter('solid_min_coverage_ratio').value) * self.num_scan_rows
+        )
+        solid = [ln for ln in lines if ln['coverage'] >= solid_min]
+        pool = solid if solid else lines
+        # 프레임 간 튐 방지: 직전 앵커에 가장 가까운 선을 유지. 직전이 없거나 너무
+        # 멀면(다른 선으로 튐) 커버리지 최대(=가장 실선다운) 선으로 재획득.
+        if self.anchor_x_prev is not None:
+            anchor = min(pool, key=lambda ln: abs(ln['median_x'] - self.anchor_x_prev))
+            if abs(anchor['median_x'] - self.anchor_x_prev) > float(
+                    self.get_parameter('track_tol_px').value):
+                anchor = max(pool, key=lambda ln: ln['coverage'])
+        else:
+            anchor = max(pool, key=lambda ln: ln['coverage'])
+        self.anchor_x_prev = anchor['median_x']
+
+        line_x = anchor['bottom_x']  # 근거리 x 기준(조향 반응성)
+        target = float(self.get_parameter('entry_target_ratio').value) * (width / 2.0)
+        lane_center = line_x + side * target       # 링 쪽으로 target 만큼 치우쳐 따라감
+        raw_offset = (lane_center - center_x) / (width / 2.0)
+        return self._make_result(width, height, center_x, raw_offset, lane_center, anchor['pts'])
+
     def update_junction_count(self, yellow):
         """IN_LOOP 중 출구(junction)를 rising-edge 로 카운트한다. junction 위에
         올라서는 '그 순간' 한 번만 +1(래치+디바운스)."""
@@ -420,16 +531,18 @@ class LaneDetectionNode(Node):
         self.loop_enter_time = None
         self.junction_count = 0
         self.junction_active = False
+        self.anchor_x_prev = None
 
     def roundabout_step(self, edge, yellow):
         """회전 교차로 FSM. 상태별로 흰/노란 마스크를 detect_lane 에 태워 처리한다.
 
         LANE_FOLLOW : 흰 차선 주행. 노란 비율 급증 → ENTER.
-        ENTER       : 링안쪽 bias + 노란선 추종. 흰 비율 낮아짐(or 타임아웃) → IN_LOOP.
-        IN_LOOP     : 두 노란선 중앙 주행 + 출구 랜드마크 카운트.
+        ENTER       : 가장 연속적인 노란 실선에 앵커해 링으로 파고듦(follow_solid_into_ring).
+                      흰 비율 낮아짐(or 타임아웃) → IN_LOOP.
+        IN_LOOP     : 같은 실선 앵커로 링 주행 + 출구 랜드마크 카운트(원본 yellow).
                       (카운트 > exits_to_skip AND 시간≥min) 또는 시간≥max → EXIT.
         EXIT        : 출구쪽 bias + 노란 램프 추종. 노란 비율 낮아짐(or 타임아웃) → LANE_FOLLOW.
-        중앙잡기는 detect_on_yellow(닫힌 노란)로, 출구 카운트는 원본 yellow 로 한다."""
+        진입/회전은 실선 앵커(다중선 튐 제거), 출구 카운트는 원본 yellow 로 한다."""
         yr, wr = self.lane_ratios(edge, yellow)      # 비율(해상도 무관)
         yc = self.closed_yellow(yellow)              # 중앙잡기용(닫힘). 카운트는 원본.
         enter_yr = float(self.get_parameter('enter_yellow_ratio').value)
@@ -452,12 +565,9 @@ class LaneDetectionNode(Node):
         if self.rstate == 'ENTER':
             if self._trans(wr <= onring_wr) or self.elapsed_in_state() >= enter_to:
                 self.enter_loop()
-            if bool(self.get_parameter('enter_follow_single').value):
-                return self.follow_dashed_into_ring(yc)      # 점선 따라가기(닫힌루프)
-            return self.apply_side_bias(                      # 옛 방식(두 선 중앙+bias)
-                self.detect_on_yellow(yc),
-                float(self.get_parameter('enter_bias').value),
-            )
+            # 진입: 가장 연속적인 노란 실선 하나에 앵커해 링으로 파고든다.
+            # (점선+실선 다중선에서 좌/우 짝짓기가 매 프레임 튀던 문제 제거)
+            return self.follow_solid_into_ring(yellow)
 
         # ---- IN_LOOP: 두 노란선 중앙 주행 + 출구 랜드마크 카운트(원본 yellow) ----
         if self.rstate == 'IN_LOOP':
@@ -466,7 +576,9 @@ class LaneDetectionNode(Node):
             take_exit = self.junction_count > exits_to_skip and elapsed >= min_loop
             if take_exit or elapsed >= max_loop:   # max_loop = 무한회전 백스톱
                 self.set_state('EXIT')
-            return self.detect_on_yellow(yc)
+            # 링 주행도 같은 실선 앵커로(중앙잡기는 출구에서 갈라져 이탈 유발).
+            # '한 바퀴 완주 후 원하는 출구 탈출' 정밀화는 다음 단계(안쪽 연속원 앵커).
+            return self.follow_solid_into_ring(yellow)
 
         # ---- EXIT: 노랑→흰 '합류'. 흰+노랑 합쳐 따라가 색전환에도 안 놓침 ----
         # 흰 비율이 exit_white_ratio 이상(=흰선 확보) 또는 노랑 소멸/타임아웃 시 LANE_FOLLOW.
@@ -776,6 +888,10 @@ class LaneDetectionNode(Node):
         detection.left_detected = result['left_detected']
         detection.right_detected = result['right_detected']
         detection.confidence = result['confidence']
+        # 회전로 FSM 상태를 하류로 전달(interpret 가 회전로 구간 감속에 사용).
+        detection.drive_state = {
+            'LANE_FOLLOW': 0, 'ENTER': 1, 'IN_LOOP': 2, 'EXIT': 3,
+        }.get(self.rstate, 0)
         self.detection_pub.publish(detection)
 
         if self.debug_pub is not None:

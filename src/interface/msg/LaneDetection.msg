@@ -16,3 +16,7 @@ float32 raw_offset
 bool  left_detected      # 좌측 차선 검출 여부
 bool  right_detected     # 우측 차선 검출 여부
 float32 confidence       # 인식 신뢰도 0.0~1.0 (검출 줄 수 / 전체 스캔 줄 수)
+
+# 회전 교차로 FSM 상태 (하류 interpret 가 회전로 구간 감속에 사용).
+# 0=LANE_FOLLOW(본선), 1=ENTER(진입), 2=IN_LOOP(회전), 3=EXIT(탈출)
+uint8 drive_state

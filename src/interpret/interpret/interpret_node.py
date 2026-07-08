@@ -128,6 +128,11 @@ class InterpretNode(Node):
         # 가장자리를 스침 -> 감속해야 라인 유지.
         # throttle = cruise × lerp(1.0, curve_throttle_scale, w). w=1 에서 이 비율로.
         self.declare_parameter('curve_throttle_scale', 0.9)
+        # 회전로 감속: lane_detection 의 drive_state(0=본선, 1~3=회전로 진입/회전/탈출)
+        # 가 회전로 구간이면 스로틀에 이 배율을 곱해 강제 저속화한다. 진입로 다중선을
+        # 안정적으로 인지·추종하려면 저속이라야 한다(고속에선 반응 프레임 부족으로
+        # 이탈). 본선 주행(drive_state=0)엔 영향 없음(배율 1.0).
+        self.declare_parameter('roundabout_throttle_scale', 0.5)
 
         # --- 페일세이프 -----------------------------------------------------
         self.declare_parameter('min_confidence', 0.2)   # 미만 -> lost 취급
@@ -190,6 +195,8 @@ class InterpretNode(Node):
 
         offset = self.filter_offset(float(msg.raw_offset), detected, single_line)
         confidence = float(msg.confidence)
+        # 회전로 감속용 FSM 상태. 구버전(필드 없는) msg 에도 안전하게 0 fallback.
+        drive_state = int(getattr(msg, 'drive_state', 0))
 
         # 1) 판단 결과를 LaneInfo 로도 발행(디버그/rosbag; 런타임 구독자는 없음).
         lane_info = LaneInfo()
@@ -202,7 +209,7 @@ class InterpretNode(Node):
         self.lane_pub.publish(lane_info)
 
         # 2) 제어결정(PID) -> Control 발행.
-        self.run_control(offset, confidence)
+        self.run_control(offset, confidence, drive_state)
 
     # ------------------------------------------------------------------ filters
     def filter_offset(self, raw_offset, detected, single_line):
@@ -221,7 +228,7 @@ class InterpretNode(Node):
         return float(max(-1.0, min(1.0, self.offset_filtered)))
 
     # ------------------------------------------------------------------ control
-    def run_control(self, offset, confidence):
+    def run_control(self, offset, confidence, drive_state=0):
         """판단된 offset/confidence 로 offset PID 를 돌려 조향/스로틀을 계산하고
         Control 을 발행한다. 프레임 도착마다 호출(이벤트구동).
         dt 는 콜백 간 실제 경과시간(프레임 간격)을 쓴다."""
@@ -290,7 +297,11 @@ class InterpretNode(Node):
         curve_thr_scale = float(self.get_parameter('curve_throttle_scale').value)
 
         throttle_scale = lerp(1.0, curve_thr_scale, w)
-        target_throttle = 0.0 if low_conf else clip(cruise * throttle_scale, 0.0, max_throttle)
+        # 회전로 구간이면 추가 감속(FSM drive_state). 본선은 rb_scale=1.0.
+        rb_scale = (float(self.get_parameter('roundabout_throttle_scale').value)
+                    if drive_state != 0 else 1.0)
+        target_throttle = (0.0 if low_conf
+                           else clip(cruise * throttle_scale * rb_scale, 0.0, max_throttle))
 
         step = slew * dt
         if target_throttle > self.throttle_cmd:
@@ -304,7 +315,7 @@ class InterpretNode(Node):
             self.get_logger().info(
                 f'off={offset:+.3f} i={i_term:+.3f} d={d_offset:+.3f} '
                 f'conf={confidence:.2f} w={w:.2f} kp={kp:.2f} '
-                f'-> steer={steering:+.3f} thr={self.throttle_cmd:.3f}'
+                f'-> steer={steering:+.3f} thr={self.throttle_cmd:.3f} rb={drive_state}'
             )
 
     def publish_control(self, steering, throttle):
