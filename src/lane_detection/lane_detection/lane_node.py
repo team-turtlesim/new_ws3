@@ -674,8 +674,13 @@ class LaneDetectionNode(Node):
             take_exit = self.junction_count > exits_to_skip and elapsed >= min_loop
             if take_exit or elapsed >= max_loop:   # max_loop = 무한회전 백스톱
                 self.set_state('EXIT')
-            # 원 주행: 안쪽 중앙섬 선에 앵커해 돈다(바깥 선은 출구서 갈라져 이탈 유발).
-            return self.follow_ring(yellow)
+            # 평상시(진입로 직진·링 직선부)엔 흰색과 '동일한' 중앙잡기(detect_lane)를
+            # 노란 마스크에 그대로 적용 → 색 구별 없이 두 선 사이 가운데 주행(안정적).
+            # 단, 출구(junction) 위에 올라선 순간엔 바깥 선이 갈라져 중앙잡기가 출구로
+            # 끌려가므로, 그때만 안쪽 선 앵커(follow_ring)로 이탈을 버틴다.
+            if self.junction_active:
+                return self.follow_ring(yellow)
+            return self.detect_on_yellow(yc)
 
         # ---- EXIT: 노랑→흰 '합류'. 흰+노랑 합쳐 따라가 색전환에도 안 놓침 ----
         # 흰 비율이 exit_white_ratio 이상(=흰선 확보) 또는 노랑 소멸/타임아웃 시 LANE_FOLLOW.
