@@ -134,8 +134,10 @@ class LaneDetectionNode(Node):
         self.declare_parameter('exits_to_skip', 1)
 
         # --- 시간 백스톱(초) — 임계값이 어긋나 상태에 '갇히는' 것 방지 ---
-        self.declare_parameter('min_loop_sec', 3.0)       # 이 전엔 탈출 금지(조기탈출 방지)
-        self.declare_parameter('max_loop_sec', 25.0)      # 이 후엔 강제 탈출(무한회전 방지)
+        # A안: IN_LOOP 진입 후 이 시간(≈한 바퀴 도는 시간) 지나면 EXIT 로 전환한다.
+        # 실측 랩타임에 맞춰 튜닝(너무 짧으면 덜 돌고 나가고, 너무 길면 더 돈 뒤 나감).
+        self.declare_parameter('min_loop_sec', 8.0)
+        self.declare_parameter('max_loop_sec', 25.0)      # (미사용, B안/백스톱 대비 보존)
         self.declare_parameter('enter_timeout_sec', 5.0)  # ENTER 갇힘 방지 → 강제 IN_LOOP
         self.declare_parameter('exit_timeout_sec', 6.0)   # EXIT 갇힘 방지 → 강제 LANE_FOLLOW
 
@@ -701,31 +703,26 @@ class LaneDetectionNode(Node):
 
         # ---- IN_LOOP: 두 노란선 중앙 주행 + 출구 랜드마크 카운트(원본 yellow) ----
         if self.rstate == 'IN_LOOP':
-            self.update_junction_count(yellow)
-            elapsed = self.elapsed_in_loop()
-            take_exit = self.junction_count > exits_to_skip and elapsed >= min_loop
-            if take_exit or elapsed >= max_loop:   # max_loop = 무한회전 백스톱
+            self.update_junction_count(yellow)   # 카운트 유지(B안/디버그 대비)
+            # A안 탈출 트리거: 시간으로 ≥1바퀴 보장(min_loop_sec) 후 EXIT 로 전환.
+            # EXIT 에서 안쪽 가드레일을 풀면 중앙잡기가 다음 출구 개구부에서 자연히 나간다.
+            if self.elapsed_in_loop() >= min_loop:
                 self.set_state('EXIT')
             # 진입로 직진·링 직선부: 흰색과 '동일한' 중앙잡기(detect_lane)를 노란 마스크에
             # 그대로 적용 → 색 구별 없이 두 선 사이 가운데 주행. 여기에 '안쪽 가드레일'을
             # 걸어, 출구에서 바깥 선이 갈라져도 링차로 중앙보다 바깥으로 못 끌려가게 막는다.
             return self.guard_inner(self.detect_on_yellow(yc), yellow)
 
-        # ---- EXIT: 노랑→흰 '합류'. 흰+노랑 합쳐 따라가 색전환에도 안 놓침 ----
-        # 흰 비율이 exit_white_ratio 이상(=흰선 확보) 또는 노랑 소멸/타임아웃 시 LANE_FOLLOW.
+        # ---- EXIT: 안쪽 가드레일을 풀고 중앙잡기 → 갈라진 바깥선 따라 출구로 나감 ----
+        # 흰선 확보(wr↑) 또는 노랑 소멸(yr↓) 또는 타임아웃이면 본선(LANE_FOLLOW) 복귀.
         exit_wr = float(self.get_parameter('exit_white_ratio').value)
         if (self._trans(wr >= exit_wr or yr <= exit_yr)
                 or self.elapsed_in_state() >= exit_to):
             self.reset_roundabout()
             return self.detect_lane(edge)
-        if bool(self.get_parameter('exit_use_both').value):
-            follow = cv2.bitwise_or(edge, yc)    # 흰+노랑 합침(합류 공백 제거)
-        else:
-            follow = yc                          # 노란 램프만
-        return self.apply_side_bias(
-            self.detect_lane(follow),
-            float(self.get_parameter('exit_bias').value),
-        )
+        # 가드 없는 중앙잡기: 링 직선부에선 그대로 돌다, 출구 개구부에서 갈라진 바깥선을
+        # 따라 자연히 밖으로 나간다(IN_LOOP 와 달리 guard_inner 를 안 건다).
+        return self.detect_on_yellow(yc)
     def detect_lane(self, edge):
         """ROI 안에서 행별로 좌/우 차선 x좌표를 찾아 '그 순간'의 차선 중심과
         offset/confidence 를 계산한다. 시간 평활은 하지 않는다."""
