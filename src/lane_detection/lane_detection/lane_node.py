@@ -499,6 +499,52 @@ class LaneDetectionNode(Node):
         raw_offset = (lane_center - center_x) / (width / 2.0)
         return self._make_result(width, height, center_x, raw_offset, lane_center, anchor['pts'])
 
+    def follow_yellow(self, yellow):
+        """노란 구역 주행: 상황에 따라 '중앙잡기'와 '단일 실선 앵커'를 자동 전환한다.
+          - 내가 있는 차로를 이루는 '중앙을 사이에 둔 두 실선'이 충분히 떨어져 보이면
+            → 그 사이 중앙 주행(원래 라인 가운데 잡기). 진입로 직진/링에서 이 경우라
+              한쪽에 안 붙고 안정적이다.
+          - 그런 두 선이 없으면(흰→노랑 전환부·다중선·단일선) → 가장 연속적인 실선
+            하나에 앵커해 링 쪽으로 커밋(follow_solid_into_ring).
+        닫힘 마스크로 점선 flicker 를 메워 중앙잡기를 안정화한다. 오버레이는 중앙잡기면
+        빨강+파랑(두 선), 앵커면 빨강 한 줄로 보여 현재 모드를 눈으로 알 수 있다."""
+        yc = self.closed_yellow(yellow)
+        height, width = yc.shape
+        center_x = width / 2.0
+        solid_min = (
+            float(self.get_parameter('solid_min_coverage_ratio').value) * self.num_scan_rows
+        )
+        min_sep = float(self.get_parameter('min_lane_sep_ratio').value) * width
+        lines = self.detect_yellow_lines(yc)
+        solid = [ln for ln in lines if ln['coverage'] >= solid_min]
+        # 중앙(center_x)을 사이에 둔, 가장 가까운 좌/우 실선 = 내가 있는 차로의 두 선
+        lefts = [ln for ln in solid if ln['bottom_x'] < center_x]
+        rights = [ln for ln in solid if ln['bottom_x'] >= center_x]
+        if lefts and rights:
+            left = max(lefts, key=lambda ln: ln['bottom_x'])
+            right = min(rights, key=lambda ln: ln['bottom_x'])
+            if right['bottom_x'] - left['bottom_x'] >= min_sep:
+                lane_center = 0.5 * (left['bottom_x'] + right['bottom_x'])
+                raw_offset = float(
+                    np.clip((lane_center - center_x) / (width / 2.0), -1.0, 1.0))
+                self.anchor_x_prev = lane_center  # 앵커 트래킹 연속성 유지
+                return {
+                    'raw_offset': raw_offset,
+                    'left_detected': True,
+                    'right_detected': True,
+                    'confidence': 0.6,
+                    'lane_center': lane_center,
+                    'center_x': center_x,
+                    'image_width': int(width),
+                    'image_height': int(height),
+                    'left_pts': left['pts'],
+                    'right_pts': right['pts'],
+                    'left_poly': None,
+                    'right_poly': None,
+                }
+        # 중앙을 사이에 둔 두 실선이 없음 → 단일 실선 앵커(전환부 커밋)
+        return self.follow_solid_into_ring(yellow)
+
     def update_junction_count(self, yellow):
         """IN_LOOP 중 출구(junction)를 rising-edge 로 카운트한다. junction 위에
         올라서는 '그 순간' 한 번만 +1(래치+디바운스)."""
@@ -565,9 +611,8 @@ class LaneDetectionNode(Node):
         if self.rstate == 'ENTER':
             if self._trans(wr <= onring_wr) or self.elapsed_in_state() >= enter_to:
                 self.enter_loop()
-            # 진입: 가장 연속적인 노란 실선 하나에 앵커해 링으로 파고든다.
-            # (점선+실선 다중선에서 좌/우 짝짓기가 매 프레임 튀던 문제 제거)
-            return self.follow_solid_into_ring(yellow)
+            # 진입: 두 실선이 깔끔하면 중앙잡기, 난잡하면 단일 실선 앵커로 자동 전환.
+            return self.follow_yellow(yellow)
 
         # ---- IN_LOOP: 두 노란선 중앙 주행 + 출구 랜드마크 카운트(원본 yellow) ----
         if self.rstate == 'IN_LOOP':
@@ -576,9 +621,9 @@ class LaneDetectionNode(Node):
             take_exit = self.junction_count > exits_to_skip and elapsed >= min_loop
             if take_exit or elapsed >= max_loop:   # max_loop = 무한회전 백스톱
                 self.set_state('EXIT')
-            # 링 주행도 같은 실선 앵커로(중앙잡기는 출구에서 갈라져 이탈 유발).
-            # '한 바퀴 완주 후 원하는 출구 탈출' 정밀화는 다음 단계(안쪽 연속원 앵커).
-            return self.follow_solid_into_ring(yellow)
+            # 링 주행도 같은 하이브리드로: 두 노란선이 깔끔하면 중앙잡기(원래 설계),
+            # 난잡하면 단일 실선 앵커. '한 바퀴 완주 후 출구 탈출' 정밀화는 다음 단계.
+            return self.follow_yellow(yellow)
 
         # ---- EXIT: 노랑→흰 '합류'. 흰+노랑 합쳐 따라가 색전환에도 안 놓침 ----
         # 흰 비율이 exit_white_ratio 이상(=흰선 확보) 또는 노랑 소멸/타임아웃 시 LANE_FOLLOW.
