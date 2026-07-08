@@ -552,6 +552,38 @@ class LaneDetectionNode(Node):
         raw_offset = float(np.clip((lane_center - center_x) / (width / 2.0), -1.0, 1.0))
         return self._make_result(width, height, center_x, raw_offset, lane_center, anchor['pts'])
 
+    def guard_inner(self, result, yellow):
+        """중앙잡기(detect_lane) 결과를 '안쪽 선 기준 링차로 중앙'보다 바깥(출구쪽)으로
+        못 가게 한쪽 방향으로만 클램프한다. 출구에서 바깥 선이 갈라져 중앙잡기가 출구로
+        끌려나가는 걸 막되, 링 직선부에선 중앙잡기와 한계가 거의 같아 영향이 없다.
+        loop_inner_side 로 안쪽(중앙섬) 방향을 지정한다(+1=오른쪽)."""
+        lc = result.get('lane_center')
+        if lc is None:
+            return result
+        yc = self.closed_yellow(yellow)
+        lines = self.detect_yellow_lines(yc)
+        if not lines:
+            return result
+        solid_min = (
+            float(self.get_parameter('solid_min_coverage_ratio').value) * self.num_scan_rows
+        )
+        solid = [ln for ln in lines if ln['coverage'] >= solid_min] or lines
+        inner_side = 1 if int(self.get_parameter('loop_inner_side').value) >= 0 else -1
+        inner = (max(solid, key=lambda ln: ln['bottom_x']) if inner_side > 0
+                 else min(solid, key=lambda ln: ln['bottom_x']))
+        width = result['image_width']
+        target = float(self.get_parameter('loop_target_ratio').value) * (width / 2.0)
+        nominal = inner['bottom_x'] - inner_side * target   # 안쪽 기준 링차로 중앙
+        # lane_center 가 nominal 보다 '바깥(-inner_side 방향)'으로 가면 nominal 로 막음.
+        clamped = max(lc, nominal) if inner_side > 0 else min(lc, nominal)
+        if clamped != lc:
+            result = dict(result)
+            result['lane_center'] = clamped
+            center_x = result['center_x']
+            result['raw_offset'] = float(
+                np.clip((clamped - center_x) / (width / 2.0), -1.0, 1.0))
+        return result
+
     def follow_yellow(self, yellow):
         """노란 구역 주행: 상황에 따라 '중앙잡기'와 '단일 실선 앵커'를 자동 전환한다.
           - 내가 있는 차로를 이루는 '중앙을 사이에 둔 두 실선'이 충분히 떨어져 보이면
@@ -674,13 +706,10 @@ class LaneDetectionNode(Node):
             take_exit = self.junction_count > exits_to_skip and elapsed >= min_loop
             if take_exit or elapsed >= max_loop:   # max_loop = 무한회전 백스톱
                 self.set_state('EXIT')
-            # 평상시(진입로 직진·링 직선부)엔 흰색과 '동일한' 중앙잡기(detect_lane)를
-            # 노란 마스크에 그대로 적용 → 색 구별 없이 두 선 사이 가운데 주행(안정적).
-            # 단, 출구(junction) 위에 올라선 순간엔 바깥 선이 갈라져 중앙잡기가 출구로
-            # 끌려가므로, 그때만 안쪽 선 앵커(follow_ring)로 이탈을 버틴다.
-            if self.junction_active:
-                return self.follow_ring(yellow)
-            return self.detect_on_yellow(yc)
+            # 진입로 직진·링 직선부: 흰색과 '동일한' 중앙잡기(detect_lane)를 노란 마스크에
+            # 그대로 적용 → 색 구별 없이 두 선 사이 가운데 주행. 여기에 '안쪽 가드레일'을
+            # 걸어, 출구에서 바깥 선이 갈라져도 링차로 중앙보다 바깥으로 못 끌려가게 막는다.
+            return self.guard_inner(self.detect_on_yellow(yc), yellow)
 
         # ---- EXIT: 노랑→흰 '합류'. 흰+노랑 합쳐 따라가 색전환에도 안 놓침 ----
         # 흰 비율이 exit_white_ratio 이상(=흰선 확보) 또는 노랑 소멸/타임아웃 시 LANE_FOLLOW.
