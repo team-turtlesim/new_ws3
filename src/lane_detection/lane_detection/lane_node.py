@@ -179,6 +179,10 @@ class LaneDetectionNode(Node):
         # 두 경계선 사이 '가운데 밴드'의 노란 채움 비율이 이 값 이상이면 마커 위로 본다.
         # 평소 링 위에선 가운데가 검은 도로라 ~0, 12시 가로 실선을 지날 땐 노랑이 채워짐.
         self.declare_parameter('marker_fill_ratio', 0.15)
+        # --- 3단계: 마커 카운트로 탈출 결정 ---
+        # 12시 마커를 이 횟수만큼 지나면 탈출한다. 진입=7시라 1번째는 반바퀴(스킵),
+        # 2번째에서 나감(한 바퀴 이상). 트랙 흐름에 맞춰 튜닝.
+        self.declare_parameter('marker_exit_count', 2)
 
         # --- 내부 상태 ------------------------------------------------------
         # 차선폭(px)은 기하 상태라 인지에 둔다. 양쪽 검출 시 EMA로 학습해
@@ -436,8 +440,10 @@ class LaneDetectionNode(Node):
             'right_poly': None,
         }
 
-    def follow_bounded_center(self, yellow):
+    def follow_bounded_center(self, yellow, skip_leftmost=False):
         """'맨 왼쪽 선'과 '거기서 한 차선폭 이내의 가장 오른쪽 선' 사이 정중앙을 따라간다.
+        skip_leftmost=True 면 맨 왼쪽 선(12시의 '나가는 차선')을 빼고 그 오른쪽 링 경계
+        두 선의 중앙을 잡아, 12시에서 아직 나갈 때가 아닐 때 링에 붙어 계속 돌게 한다.
         - 두 선의 midpoint 라 항상 정확히 가운데 → 한쪽 쏠림 없음(단일선 앵커 폐기).
         - 오른쪽 경계를 'boundary_max_width_ratio×폭' 이내로 제한 → 진입 접합부의 먼
           곡선 실선(링 반대편)은 제외, 올바른 오른쪽 점선만 포함. 가운데 비스듬 점선도
@@ -450,6 +456,8 @@ class LaneDetectionNode(Node):
         lines = sorted(self.detect_yellow_lines(yc), key=lambda ln: ln['bottom_x'])
         if not lines:
             return self._make_result(width, height, center_x, 0.0, None, [])
+        if skip_leftmost and len(lines) >= 2:
+            lines = lines[1:]                              # 맨 왼쪽(나가는 차선) 제외
         left = lines[0]                                    # 맨 왼쪽 = 좌 경계
         max_w = float(self.get_parameter('boundary_max_width_ratio').value) * width
         cands = [ln for ln in lines if ln['bottom_x'] <= left['bottom_x'] + max_w]
@@ -477,6 +485,22 @@ class LaneDetectionNode(Node):
             'left_poly': None,
             'right_poly': None,
         }
+
+    def follow_exit(self, yellow):
+        """3단계 탈출: 맨 왼쪽(12시의 '나가는 차선') 선을 따라 링 밖으로 나간다.
+        그 선 기준 도로 안쪽(오른쪽)으로 반 차선폭 오프셋해 나가는 차선 안으로 들어가
+        따라 나간다. 선이 위 연결로로 굽어 올라가니 차도 따라 링을 빠져나온다."""
+        yc = self.closed_yellow(yellow)
+        height, width = yc.shape
+        center_x = width / 2.0
+        lines = sorted(self.detect_yellow_lines(yc), key=lambda ln: ln['bottom_x'])
+        if not lines:
+            return self._make_result(width, height, center_x, 0.0, None, [])
+        lane = lines[0]                                    # 맨 왼쪽 = 나가는 차선
+        target = float(self.get_parameter('loop_target_ratio').value) * (width / 2.0)
+        lane_center = lane['bottom_x'] + target            # 나가는 차선 안쪽(오른쪽)으로
+        raw_offset = float(np.clip((lane_center - center_x) / (width / 2.0), -1.0, 1.0))
+        return self._make_result(width, height, center_x, raw_offset, lane_center, lane['pts'])
 
     def detect_yellow_lines(self, mask):
         """노란 마스크에서 세로선(차선)들을 '개수 제한 없이' 각각 분리한다.
@@ -779,33 +803,29 @@ class LaneDetectionNode(Node):
             # 진입: 가장 연속적인 노란 실선 하나에 앵커해 branch_side 쪽으로 따라간다.
             return self.follow_solid_into_ring(yellow)
 
-        # ---- IN_LOOP(1+2단계): 두 선 정중앙 주행 + 12시 마커 감지/카운트(주행 무변경) ----
-        # 2단계: update_marker_count 로 12시 가로 실선 마커를 세기만 한다(디버그로 확인).
-        # 주행은 1단계 그대로(follow_bounded_center). 마커 기반 계속돎/탈출은 3단계에서.
+        # ---- IN_LOOP(1+2+3단계): 두 선 정중앙 주행 + 12시 마커 카운트로 계속돎/탈출 ----
+        # 3단계: 12시 마커를 세서 marker_exit_count 도달 시 탈출(나가는차선 따라감).
+        #   그 전엔 12시 마커 위(marker_active)면 나가는차선(맨왼쪽) 제외하고 링에 붙는다.
         if self.rstate == 'IN_LOOP':
-            self.update_junction_count(yellow)   # (기존 탈출 트리거 유지)
-            self.update_marker_count(yellow)     # 2단계: 12시 마커 카운트(주행엔 미반영)
-            elapsed = self.elapsed_in_loop()
-            take_exit = self.junction_count > exits_to_skip and elapsed >= min_loop
-            if take_exit or elapsed >= max_loop:   # max_loop = 무한회전 백스톱
-                self.set_state('EXIT')
+            self.update_marker_count(yellow)
+            exit_count = int(self.get_parameter('marker_exit_count').value)
+            if self.marker_count >= exit_count or self.elapsed_in_loop() >= max_loop:
+                self.set_state('EXIT')            # 목표 랩 도달(or 무한회전 백스톱) → 탈출
+                self.anchor_x_prev = None
+                return self.follow_exit(yellow)
+            if self.marker_active:
+                # 12시 마커 위인데 아직 나갈 때 아님 → 나가는차선 빼고 링에 붙어 계속 돎
+                return self.follow_bounded_center(yellow, skip_leftmost=True)
             return self.follow_bounded_center(yellow)
 
-        # ---- EXIT: 노랑→흰 '합류'. 흰+노랑 합쳐 따라가 색전환에도 안 놓침 ----
-        # 흰 비율이 exit_white_ratio 이상(=흰선 확보) 또는 노랑 소멸/타임아웃 시 LANE_FOLLOW.
+        # ---- EXIT(3단계): 나가는 차선(맨왼쪽)을 따라 링 밖으로 나감 ----
+        # 흰선 확보(wr↑) 또는 노랑 소멸(yr↓) 또는 타임아웃이면 본선(LANE_FOLLOW) 복귀.
         exit_wr = float(self.get_parameter('exit_white_ratio').value)
         if (self._trans(wr >= exit_wr or yr <= exit_yr)
                 or self.elapsed_in_state() >= exit_to):
             self.reset_roundabout()
             return self.detect_lane(edge)
-        if bool(self.get_parameter('exit_use_both').value):
-            follow = cv2.bitwise_or(edge, yc)    # 흰+노랑 합침(합류 공백 제거)
-        else:
-            follow = yc                          # 노란 램프만
-        return self.apply_side_bias(
-            self.detect_lane(follow),
-            float(self.get_parameter('exit_bias').value),
-        )
+        return self.follow_exit(yellow)
     def detect_lane(self, edge):
         """ROI 안에서 행별로 좌/우 차선 x좌표를 찾아 '그 순간'의 차선 중심과
         offset/confidence 를 계산한다. 시간 평활은 하지 않는다."""
