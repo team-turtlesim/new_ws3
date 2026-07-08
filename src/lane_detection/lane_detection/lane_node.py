@@ -700,21 +700,25 @@ class LaneDetectionNode(Node):
                 self.set_state('ENTER')
             return self.detect_lane(edge)
 
-        # ---- ENTER(진입로): 순수 중앙잡기(가드 OFF). approach_sec 지나면 원으로 ----
-        # 진입로엔 점선이 있어 오른선 앵커를 켜면 오른쪽으로 쏠린다. 그래서 여기선
-        # 흰색과 동일한 중앙잡기로 두 선 사이 가운데를 지나고, approach_sec 뒤 원 진입.
+        # ---- ENTER(흰→노랑 전환): 노란 실선 앵커로 진입로에 '커밋' ----
+        # 갈림길에선 중앙잡기가 발산하므로, 노란선 하나에 앵커해 확실히 꺾어 들어간다.
+        # 흰 비율 낮아지면(진입 완료) 또는 타임아웃 → IN_LOOP.
         if self.rstate == 'ENTER':
-            if self.elapsed_in_state() >= float(self.get_parameter('approach_sec').value):
+            if self._trans(wr <= onring_wr) or self.elapsed_in_state() >= enter_to:
                 self.enter_loop()
-            return self.detect_on_yellow(yc)
+            return self.follow_solid_into_ring(yellow)
 
-        # ---- IN_LOOP(원): 안쪽(오른쪽)선만 앵커해 돎. min_loop 지나면 탈출 ----
-        # 안쪽 중앙섬 선은 닫힌 원이라 출구서 안 갈라짐 → 안 끌려나가고 계속 돎.
+        # ---- IN_LOOP: 진입로 직진(중앙잡기) → approach_sec 뒤 원(안쪽선) → min_loop 뒤 탈출 ----
         if self.rstate == 'IN_LOOP':
-            if self.elapsed_in_loop() >= min_loop:   # ≈한 바퀴 시간 → 탈출
+            elapsed = self.elapsed_in_loop()
+            if elapsed >= min_loop:                    # ≈한 바퀴 → 탈출
                 self.set_state('EXIT')
-                self.anchor_x_prev = None             # EXIT 에서 바깥선 재획득
-            return self.follow_ring(yellow)           # anchor_side=None → 안쪽선
+                self.anchor_x_prev = None              # EXIT 에서 바깥선 재획득
+                inner = 1 if int(self.get_parameter('loop_inner_side').value) >= 0 else -1
+                return self.follow_ring(yellow, anchor_side=-inner)   # 바로 바깥선 탈출
+            if elapsed < float(self.get_parameter('approach_sec').value):
+                return self.detect_on_yellow(yc)       # 진입로: 중앙잡기(안 쏠림)
+            return self.follow_ring(yellow)            # 원: 안쪽선만 앵커
 
         # ---- EXIT: 바깥선만 앵커 → 출구서 갈라진 바깥선을 따라 밖으로 나감 ----
         # 흰선 확보(wr↑) 또는 노랑 소멸(yr↓) 또는 타임아웃이면 본선(LANE_FOLLOW) 복귀.
