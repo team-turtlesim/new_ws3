@@ -133,6 +133,9 @@ class InterpretNode(Node):
         # 안정적으로 인지·추종하려면 저속이라야 한다(고속에선 반응 프레임 부족으로
         # 이탈). 본선 주행(drive_state=0)엔 영향 없음(배율 1.0).
         self.declare_parameter('roundabout_throttle_scale', 0.5)
+        # 회전(IN_LOOP) 스로틀 배율. 노란 진입로 직진 구간에서 코너 감속 뒤 다시
+        # 속도를 내기 위해 기본 1.0(감속 해제). 링 진입이 빨라 불안정하면 낮춘다.
+        self.declare_parameter('roundabout_loop_throttle_scale', 1.0)
 
         # --- 페일세이프 -----------------------------------------------------
         self.declare_parameter('min_confidence', 0.2)   # 미만 -> lost 취급
@@ -297,9 +300,16 @@ class InterpretNode(Node):
         curve_thr_scale = float(self.get_parameter('curve_throttle_scale').value)
 
         throttle_scale = lerp(1.0, curve_thr_scale, w)
-        # 회전로 구간이면 추가 감속(FSM drive_state). 본선은 rb_scale=1.0.
-        rb_scale = (float(self.get_parameter('roundabout_throttle_scale').value)
-                    if drive_state != 0 else 1.0)
+        # 회전로 속도 프로파일(FSM drive_state):
+        #   ENTER(1)/EXIT(3) = 코너·전환이라 감속(roundabout_throttle_scale),
+        #   IN_LOOP(2) = 노란 직진 접근이라 속도 회복(roundabout_loop_throttle_scale),
+        #   본선(0) = 무영향(1.0).
+        if drive_state == 2:        # IN_LOOP: 직진 접근 → 다시 속도
+            rb_scale = float(self.get_parameter('roundabout_loop_throttle_scale').value)
+        elif drive_state != 0:      # ENTER/EXIT: 코너·전환 → 감속
+            rb_scale = float(self.get_parameter('roundabout_throttle_scale').value)
+        else:
+            rb_scale = 1.0
         target_throttle = (0.0 if low_conf
                            else clip(cruise * throttle_scale * rb_scale, 0.0, max_throttle))
 
