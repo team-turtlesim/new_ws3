@@ -833,8 +833,13 @@ class LaneDetectionNode(Node):
         if self.rstate == 'IN_LOOP':
             self.update_marker_count(yellow)
             exit_count = int(self.get_parameter('marker_exit_count').value)
-            if self.marker_count >= exit_count or self.elapsed_in_loop() >= max_loop:
-                self.set_state('EXIT')            # 목표 랩 도달(or 무한회전 백스톱) → 탈출
+            elapsed = self.elapsed_in_loop()
+            # 탈출 = (마커 목표 도달 AND 최소 랩타임 경과) 또는 무한회전 백스톱.
+            # min_loop_sec floor: 마커가 진입부에서 잘못 세지든 12시가 이중카운트되든,
+            # 한 바퀴 도는 최소 시간 전엔 절대 안 나가게 강제(첫 12시 조기탈출 방지).
+            min_loop = float(self.get_parameter('min_loop_sec').value)
+            if (self.marker_count >= exit_count and elapsed >= min_loop) or elapsed >= max_loop:
+                self.set_state('EXIT')
                 self.anchor_x_prev = None
                 return self.follow_exit(yellow)
             if self.marker_active:
