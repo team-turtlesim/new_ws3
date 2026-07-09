@@ -142,7 +142,7 @@ class LaneDetectionNode(Node):
         # --- 노란 점선 잇기(모폴로지 닫힘) — '중앙잡기용'에만 국소 적용 ---
         # 중앙잡기는 점선 이어야 안정적이지만, 출구 '개수 세기'는 원본이라야 3선이 안
         # 뭉친다. 그래서 닫힘은 중앙잡기 입력에만 걸고, 카운트는 원본 노란으로 센다. 0=끔.
-        self.declare_parameter('yellow_close_ksize', 5)
+        self.declare_parameter('yellow_close_ksize', 11)  # 점선 틈 충분히 메움(진입 안정)
 
         # --- 진입 전용: 노란 점선 하나 따라가기(닫힌루프) ---
         # 진입 직진 중엔 노란 '점선'만 보이고 반대편 실선은 잘 안 보인다(선 1개).
@@ -165,10 +165,12 @@ class LaneDetectionNode(Node):
         # 안쪽 선 기준 '바깥쪽'으로 얼마나 치우쳐 돌지(half-width 대비 비율). 링 차로
         # 가운데를 유지하도록 반 링폭 정도. entry_target_ratio 와 별도로 튜닝.
         self.declare_parameter('loop_target_ratio', 0.5)
-        # 경계 선택 상한(이미지폭 대비). 맨 왼쪽 선에서 이 폭 이내의 가장 오른쪽 선을
-        # 오른쪽 경계로 삼는다. 도로폭(≈0.556)보다 여유롭게(≈1.3배) 잡아, 진입 접합부의
-        # 먼 곡선 실선(링 반대편)은 제외하되 올바른 오른쪽 점선은 포함되게 한다.
+        # 경계 선택 상한(이미지폭 대비). (구 로직 잔존 파라미터; 현재는 아래 방식 사용)
         self.declare_parameter('boundary_max_width_ratio', 0.72)
+        # 오른쪽 경계를 '왼쪽선 + 한 차선폭' 기대 위치 기준 이 허용오차(차선폭 대비) 이내
+        # 에서 가장 가까운 선으로 고른다. 먼 곡선 실선은 기대에서 멀어 제외, 올바른 오른쪽
+        # 점선(≈한 차선폭)만 잡힌다. 크게 하면 관대(먼 선도 포함), 작게 하면 엄격.
+        self.declare_parameter('boundary_width_tol_ratio', 0.4)
 
         # --- 전환부 조향 bias — 목표 방향으로 밀기(다중선 오검출 회피). 음수 가능 ---
         self.declare_parameter('enter_bias', 0.2)
@@ -441,15 +443,15 @@ class LaneDetectionNode(Node):
         }
 
     def follow_bounded_center(self, yellow, skip_leftmost=False):
-        """'맨 왼쪽 선'과 '거기서 한 차선폭 이내의 가장 오른쪽 선' 사이 정중앙을 따라간다.
-        skip_leftmost=True 면 맨 왼쪽 선(12시의 '나가는 차선')을 빼고 그 오른쪽 링 경계
-        두 선의 중앙을 잡아, 12시에서 아직 나갈 때가 아닐 때 링에 붙어 계속 돌게 한다.
-        - 두 선의 midpoint 라 항상 정확히 가운데 → 한쪽 쏠림 없음(단일선 앵커 폐기).
-        - 오른쪽 경계를 'boundary_max_width_ratio×폭' 이내로 제한 → 진입 접합부의 먼
-          곡선 실선(링 반대편)은 제외, 올바른 오른쪽 점선만 포함. 가운데 비스듬 점선도
-          '상한 내 맨오른쪽'이라 밀려서 제외됨.
-        - 점선은 닫힘(closed)으로 이어 붙여 flicker(비틀거림) 제거.
-        - 선이 하나뿐이면 그 선 기준 반 차선폭만큼 도로 안쪽으로 폴백."""
+        """'맨 왼쪽 선'과 '기대 차선폭 위치에 가장 가까운 오른쪽 선' 사이 정중앙을 따라간다.
+        skip_leftmost=True 면 맨 왼쪽 선(12시의 '나가는 차선')을 빼고 그 오른쪽 링 경계로.
+        핵심(원형 진입 오검출·왼쪽 쏠림 근본 해결):
+        - 오른쪽 경계를 '상한 내 맨오른쪽'이 아니라 **왼쪽선 + 한 차선폭(default_lane_width
+          _ratio) 위치에 가장 가까운 선**으로 고른다. → 진입 접합부의 '먼 곡선 실선'은
+          기대 위치에서 너무 멀어 자동 제외, 올바른 오른쪽 점선(≈한 차선폭)만 잡힘.
+        - 오른쪽 경계를 못 찾으면(점선 미검출) → **왼쪽선 + 반 차선폭 = 정확히 가운데**로
+          폴백(고정 오프셋이 아니라 실제 차선폭의 절반이라 단일선에서도 안 붙음).
+        - 점선은 닫힘(closed)으로 이어 붙여 flicker 제거."""
         yc = self.closed_yellow(yellow)
         height, width = yc.shape
         center_x = width / 2.0
@@ -459,29 +461,35 @@ class LaneDetectionNode(Node):
         if skip_leftmost and len(lines) >= 2:
             lines = lines[1:]                              # 맨 왼쪽(나가는 차선) 제외
         left = lines[0]                                    # 맨 왼쪽 = 좌 경계
-        max_w = float(self.get_parameter('boundary_max_width_ratio').value) * width
-        cands = [ln for ln in lines if ln['bottom_x'] <= left['bottom_x'] + max_w]
-        right = cands[-1]                                  # 상한 내 가장 오른쪽 = 우 경계
-        if right is left:
-            # 상한 안에 다른 선이 없음(사실상 단일선): 반 차선폭만큼 도로 안쪽으로
-            target = float(self.get_parameter('loop_target_ratio').value) * (width / 2.0)
-            side = 1.0 if left['bottom_x'] <= center_x else -1.0
-            lane_center = left['bottom_x'] + side * target
-            raw_offset = float(np.clip((lane_center - center_x) / (width / 2.0), -1.0, 1.0))
-            return self._make_result(width, height, center_x, raw_offset, lane_center, left['pts'])
-        lane_center = 0.5 * (left['bottom_x'] + right['bottom_x'])
+        lane_w = float(self.get_parameter('default_lane_width_ratio').value) * width
+        tol = float(self.get_parameter('boundary_width_tol_ratio').value) * lane_w
+        expected_right = left['bottom_x'] + lane_w         # 오른쪽 경계 기대 위치
+        # 기대 위치에 가장 가까운 선(허용오차 이내)을 오른쪽 경계로. 먼 곡선은 기대에서
+        # 멀어 제외, 가운데 비스듬 점선도 기대(한 차선폭)보다 가까워 제외됨.
+        right, best = None, tol + 1.0
+        for ln in lines[1:]:
+            d = abs(ln['bottom_x'] - expected_right)
+            if d < best:
+                best, right = d, ln
+        if right is not None and best <= tol:
+            lane_center = 0.5 * (left['bottom_x'] + right['bottom_x'])
+            lpts, rpts = left['pts'], right['pts']
+        else:
+            # 오른쪽 경계 못 찾음(점선 미검출/먼 곡선 배제) → 왼쪽선 + 반 차선폭(정중앙)
+            lane_center = left['bottom_x'] + lane_w / 2.0
+            lpts, rpts = left['pts'], []
         raw_offset = float(np.clip((lane_center - center_x) / (width / 2.0), -1.0, 1.0))
         return {
             'raw_offset': raw_offset,
             'left_detected': True,
-            'right_detected': True,
+            'right_detected': bool(rpts),
             'confidence': 0.6,
             'lane_center': lane_center,
             'center_x': center_x,
             'image_width': int(width),
             'image_height': int(height),
-            'left_pts': left['pts'],
-            'right_pts': right['pts'],
+            'left_pts': lpts,
+            'right_pts': rpts,
             'left_poly': None,
             'right_poly': None,
         }
