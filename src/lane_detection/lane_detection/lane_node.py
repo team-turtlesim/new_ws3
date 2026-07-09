@@ -178,9 +178,10 @@ class LaneDetectionNode(Node):
         # 상태전이/랜드마크 판정 디바운스(연속 프레임 수).
         self.declare_parameter('roundabout_debounce_frames', 2)
         # --- 2단계: 12시 가로 실선 마커 감지 ---
-        # 두 경계선 사이 '가운데 밴드'의 노란 채움 비율이 이 값 이상이면 마커 위로 본다.
-        # 평소 링 위에선 가운데가 검은 도로라 ~0, 12시 가로 실선을 지날 땐 노랑이 채워짐.
-        self.declare_parameter('marker_fill_ratio', 0.15)
+        # 가운데 밴드에서 '한 가로줄의 노란 채움 최대값'이 이 값 이상이면 마커(가로 실선)로
+        # 본다. 실선은 어느 한 행을 꽉 채워 ~1, 진입부 흩어진 점선은 낮음. 0.6=행이 60%+
+        # 찼을 때만 인정 → 가짜 탈출 방지. 12시서 안 잡히면 낮추고, 진입서 오인하면 높임.
+        self.declare_parameter('marker_fill_ratio', 0.6)
         # --- 3단계: 마커 카운트로 탈출 결정 ---
         # 12시 마커를 이 횟수만큼 지나면 탈출한다. 진입=7시라 1번째는 반바퀴(스킵),
         # 2번째에서 나감(한 바퀴 이상). 트랙 흐름에 맞춰 튜닝.
@@ -455,7 +456,8 @@ class LaneDetectionNode(Node):
         yc = self.closed_yellow(yellow)
         height, width = yc.shape
         center_x = width / 2.0
-        lines = sorted(self.detect_yellow_lines(yc), key=lambda ln: ln['bottom_x'])
+        # 위치는 near_x(아래쪽 여러 점 평균)로 → 점 하나보다 덜 흔들려 부드럽게 돎.
+        lines = sorted(self.detect_yellow_lines(yc), key=lambda ln: ln['near_x'])
         if not lines:
             return self._make_result(width, height, center_x, 0.0, None, [])
         if skip_leftmost and len(lines) >= 2:
@@ -463,20 +465,20 @@ class LaneDetectionNode(Node):
         left = lines[0]                                    # 맨 왼쪽 = 좌 경계
         lane_w = float(self.get_parameter('default_lane_width_ratio').value) * width
         tol = float(self.get_parameter('boundary_width_tol_ratio').value) * lane_w
-        expected_right = left['bottom_x'] + lane_w         # 오른쪽 경계 기대 위치
+        expected_right = left['near_x'] + lane_w           # 오른쪽 경계 기대 위치
         # 기대 위치에 가장 가까운 선(허용오차 이내)을 오른쪽 경계로. 먼 곡선은 기대에서
         # 멀어 제외, 가운데 비스듬 점선도 기대(한 차선폭)보다 가까워 제외됨.
         right, best = None, tol + 1.0
         for ln in lines[1:]:
-            d = abs(ln['bottom_x'] - expected_right)
+            d = abs(ln['near_x'] - expected_right)
             if d < best:
                 best, right = d, ln
         if right is not None and best <= tol:
-            lane_center = 0.5 * (left['bottom_x'] + right['bottom_x'])
+            lane_center = 0.5 * (left['near_x'] + right['near_x'])
             lpts, rpts = left['pts'], right['pts']
         else:
             # 오른쪽 경계 못 찾음(점선 미검출/먼 곡선 배제) → 왼쪽선 + 반 차선폭(정중앙)
-            lane_center = left['bottom_x'] + lane_w / 2.0
+            lane_center = left['near_x'] + lane_w / 2.0
             lpts, rpts = left['pts'], []
         raw_offset = float(np.clip((lane_center - center_x) / (width / 2.0), -1.0, 1.0))
         return {
@@ -501,12 +503,12 @@ class LaneDetectionNode(Node):
         yc = self.closed_yellow(yellow)
         height, width = yc.shape
         center_x = width / 2.0
-        lines = sorted(self.detect_yellow_lines(yc), key=lambda ln: ln['bottom_x'])
+        lines = sorted(self.detect_yellow_lines(yc), key=lambda ln: ln['near_x'])
         if not lines:
             return self._make_result(width, height, center_x, 0.0, None, [])
         lane = lines[0]                                    # 맨 왼쪽 = 나가는 차선
         target = float(self.get_parameter('loop_target_ratio').value) * (width / 2.0)
-        lane_center = lane['bottom_x'] + target            # 나가는 차선 안쪽(오른쪽)으로
+        lane_center = lane['near_x'] + target              # 나가는 차선 안쪽(오른쪽)으로
         raw_offset = float(np.clip((lane_center - center_x) / (width / 2.0), -1.0, 1.0))
         return self._make_result(width, height, center_x, raw_offset, lane_center, lane['pts'])
 
@@ -550,9 +552,13 @@ class LaneDetectionNode(Node):
             pts = ln['pts']
             xs = [x for _, x in pts]
             bottom_x = max(pts, key=lambda p: p[0])[1]  # 가장 아래(근거리) x
+            # near_x: 아래쪽(근거리) 최대 3점의 x 평균 → 점 하나(bottom_x)보다 덜 흔들림.
+            nearest = sorted(pts, key=lambda p: -p[0])[:3]
+            near_x = float(np.mean([x for _, x in nearest]))
             out.append({
                 'median_x': float(np.median(xs)),
                 'bottom_x': float(bottom_x),
+                'near_x': near_x,
                 'coverage': len(pts),
                 'pts': pts,
             })
@@ -704,21 +710,29 @@ class LaneDetectionNode(Node):
 
     def detect_center_marker(self, yellow):
         """2단계: 12시 '가로지르는 실선 마커'를 감지한다.
-        두 경계선(맨왼쪽 + 한차선폭 이내 맨오른쪽) 사이 '가운데 밴드'의 노란 채움 비율을
-        잰다. 평소 링 위에선 가운데가 검은 도로라 ~0, 12시 가로 실선을 지날 땐 그 가운데가
-        노랑으로 채워져 비율이 확 오른다. 반환: 채움 비율(0~1). 경계 못 잡으면 0."""
+        두 경계선 사이 '가운데 밴드'에서, **한 가로줄이 노랑으로 꽉 찬 정도의 최댓값**을
+        점수로 쓴다(전체 평균이 아니라 '행별 채움의 최대'). → 12시 가로 실선은 어느 한 행을
+        좌우로 꽉 채워 점수≈1, 진입부의 흩어진 비스듬 점선은 어느 행도 꽉 못 채워 점수 낮음.
+        이렇게 '가로 실선'에만 반응하게 해 진입 접합부 오인(가짜 탈출)을 막는다."""
         yc = self.closed_yellow(yellow)
         height, width = yc.shape
         roi_top, roi_left = self.roi_bounds(height, width)
-        lines = sorted(self.detect_yellow_lines(yc), key=lambda ln: ln['bottom_x'])
+        lines = sorted(self.detect_yellow_lines(yc), key=lambda ln: ln['near_x'])
         if len(lines) < 2:
             self.dbg_marker_score = 0.0
             return 0.0
         left = lines[0]
-        max_w = float(self.get_parameter('boundary_max_width_ratio').value) * width
-        cands = [ln for ln in lines if ln['bottom_x'] <= left['bottom_x'] + max_w]
-        right = cands[-1]
-        lx, rx = left['bottom_x'], right['bottom_x']
+        lane_w = float(self.get_parameter('default_lane_width_ratio').value) * width
+        tol = float(self.get_parameter('boundary_width_tol_ratio').value) * lane_w
+        right, best = None, tol + 1.0
+        for ln in lines[1:]:
+            d = abs(ln['near_x'] - (left['near_x'] + lane_w))
+            if d < best:
+                best, right = d, ln
+        if right is None or best > tol:
+            self.dbg_marker_score = 0.0
+            return 0.0
+        lx, rx = left['near_x'], right['near_x']
         if rx - lx < 10:
             self.dbg_marker_score = 0.0
             return 0.0
@@ -730,7 +744,9 @@ class LaneDetectionNode(Node):
             self.dbg_marker_score = 0.0
             return 0.0
         band = yc[roi_top:, x0:x1]
-        score = float(np.count_nonzero(band)) / float(max(1, band.size))
+        # 행별 채움비율의 '최댓값' — 가로 실선이면 어느 한 행이 꽉 참(≈1).
+        row_fill = band.astype(bool).mean(axis=1) if band.size else np.array([0.0])
+        score = float(row_fill.max())
         self.dbg_marker_score = score
         return score
 
