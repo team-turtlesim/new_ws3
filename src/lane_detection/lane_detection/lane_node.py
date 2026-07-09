@@ -625,24 +625,24 @@ class LaneDetectionNode(Node):
         inner_side = 1 if int(self.get_parameter('loop_inner_side').value) >= 0 else -1
 
         def innermost(cands):
-            # 중앙섬 쪽(inner_side)으로 가장 치우친 선 = 안쪽 선.
-            return (max(cands, key=lambda ln: ln['bottom_x']) if inner_side > 0
-                    else min(cands, key=lambda ln: ln['bottom_x']))
+            # 중앙섬 쪽(inner_side)으로 가장 치우친 선 = 안쪽 선(안 갈라지는 연속선).
+            return (max(cands, key=lambda ln: ln['near_x']) if inner_side > 0
+                    else min(cands, key=lambda ln: ln['near_x']))
 
         # 튐 방지: 직전 앵커에 가장 가까운 선 우선, 너무 멀면 안쪽 극단으로 재획득.
         if self.anchor_x_prev is not None:
-            anchor = min(pool, key=lambda ln: abs(ln['bottom_x'] - self.anchor_x_prev))
-            if abs(anchor['bottom_x'] - self.anchor_x_prev) > float(
+            anchor = min(pool, key=lambda ln: abs(ln['near_x'] - self.anchor_x_prev))
+            if abs(anchor['near_x'] - self.anchor_x_prev) > float(
                     self.get_parameter('track_tol_px').value):
                 anchor = innermost(pool)
         else:
             anchor = innermost(pool)
-        self.anchor_x_prev = anchor['bottom_x']
+        self.anchor_x_prev = anchor['near_x']
 
-        line_x = anchor['bottom_x']
-        target = float(self.get_parameter('loop_target_ratio').value) * (width / 2.0)
-        # 안쪽 선에서 '바깥쪽'(중앙섬 반대)으로 오프셋 → 링 차로 가운데 유지.
-        lane_center = line_x - inner_side * target
+        line_x = anchor['near_x']  # near_x(3점 평균) → 부드럽게
+        # 안쪽 선에서 '바깥쪽'(중앙섬 반대)으로 '반 차선폭'만큼 → 링 차로 정중앙(안 붙음).
+        lane_w = float(self.get_parameter('default_lane_width_ratio').value) * width
+        lane_center = line_x - inner_side * (lane_w / 2.0)
         raw_offset = float(np.clip((lane_center - center_x) / (width / 2.0), -1.0, 1.0))
         return self._make_result(width, height, center_x, raw_offset, lane_center, anchor['pts'])
 
@@ -827,25 +827,20 @@ class LaneDetectionNode(Node):
             # 진입: 가장 연속적인 노란 실선 하나에 앵커해 branch_side 쪽으로 따라간다.
             return self.follow_solid_into_ring(yellow)
 
-        # ---- IN_LOOP(1+2+3단계): 두 선 정중앙 주행 + 12시 마커 카운트로 계속돎/탈출 ----
-        # 3단계: 12시 마커를 세서 marker_exit_count 도달 시 탈출(나가는차선 따라감).
-        #   그 전엔 12시 마커 위(marker_active)면 나가는차선(맨왼쪽) 제외하고 링에 붙는다.
+        # ---- IN_LOOP: '안쪽(안 갈라지는) 선' 기준으로 돌다, 12시 마커 2번째에 탈출 ----
+        # 왜 안쪽선 기준: 7시 진입로·12시 출구선(왼쪽/바깥)은 접합부에서 갈라진다. 그걸
+        # 따라가면 진입로/출구로 끌려나간다. 안쪽 선은 안 갈라지니 그걸 기준으로 돌면
+        # 어느 접합부서도 안 끌려나가고 계속 돎. 탈출은 12시 마커 count(=랩 카운터)가
+        # 목표(marker_exit_count, 보통 2=한 바퀴 완주 뒤 두 번째 12시)에 도달할 때만.
+        # 시간(min_loop) 안 씀 — 마커 개수로만 판단.
         if self.rstate == 'IN_LOOP':
             self.update_marker_count(yellow)
             exit_count = int(self.get_parameter('marker_exit_count').value)
-            elapsed = self.elapsed_in_loop()
-            # 탈출 = (마커 목표 도달 AND 최소 랩타임 경과) 또는 무한회전 백스톱.
-            # min_loop_sec floor: 마커가 진입부에서 잘못 세지든 12시가 이중카운트되든,
-            # 한 바퀴 도는 최소 시간 전엔 절대 안 나가게 강제(첫 12시 조기탈출 방지).
-            min_loop = float(self.get_parameter('min_loop_sec').value)
-            if (self.marker_count >= exit_count and elapsed >= min_loop) or elapsed >= max_loop:
-                self.set_state('EXIT')
+            if self.marker_count >= exit_count or self.elapsed_in_loop() >= max_loop:
+                self.set_state('EXIT')            # 목표 랩 도달(or 무한회전 백스톱) → 탈출
                 self.anchor_x_prev = None
-                return self.follow_exit(yellow)
-            if self.marker_active:
-                # 12시 마커 위인데 아직 나갈 때 아님 → 나가는차선 빼고 링에 붙어 계속 돎
-                return self.follow_bounded_center(yellow, skip_leftmost=True)
-            return self.follow_bounded_center(yellow)
+                return self.follow_exit(yellow)   # 그때만 바깥(나가는 차선) 따라 나감
+            return self.follow_ring(yellow)       # 평소: 안쪽 연속선 기준 → 안 끌려나감
 
         # ---- EXIT(3단계): 나가는 차선(맨왼쪽)을 따라 링 밖으로 나감 ----
         # 흰선 확보(wr↑) 또는 노랑 소멸(yr↓) 또는 타임아웃이면 본선(LANE_FOLLOW) 복귀.
