@@ -840,7 +840,10 @@ class LaneDetectionNode(Node):
                 self.set_state('EXIT')            # 목표 랩 도달(or 무한회전 백스톱) → 탈출
                 self.anchor_x_prev = None
                 return self.follow_exit(yellow)   # 그때만 바깥(나가는 차선) 따라 나감
-            return self.follow_ring(yellow)       # 평소: 안쪽 연속선 기준 → 안 끌려나감
+            # 진입로에선 오른쪽 점선이 자주 안 잡혀 안쪽선 기준(follow_ring)이 왼쪽 밖으로
+            # 나가버림 → 진입로에서 잘 되던 '두 선 정중앙(follow_bounded_center)'으로 복귀.
+            # (7시/12시 접합부 이탈 방지는 별도로: 다음 단계 임시 라인 추적으로 해결 예정)
+            return self.follow_bounded_center(yellow)
 
         # ---- EXIT(3단계): 나가는 차선(맨왼쪽)을 따라 링 밖으로 나감 ----
         # 흰선 확보(wr↑) 또는 노랑 소멸(yr↓) 또는 타임아웃이면 본선(LANE_FOLLOW) 복귀.
